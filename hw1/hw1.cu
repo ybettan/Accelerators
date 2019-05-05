@@ -70,85 +70,11 @@ long long int distance_sqr_between_image_arrays(uchar *img_arr1, uchar *img_arr2
 }
 ///////////////////////////////////////////////////////////////////////////////
 
-//__device__ int* compute_histogram(uchar *img, uchar *out) {
-//
-//     /* use the first 256*sizeof(int) byte of out argument to store the global
-//      * histogram */
-//    int *global_hist = (int*)out;
-//    int tid = blockIdx.x * blockDim.x + blockIdx.x;
-//
-//    /* each threadBlock have its own local histogram */
-//    __shared__ int local_hist[256];
-//
-//    /* initialize the local histogram */
-//    if (tid < 256) {
-//        local_hist[tid] = 0;
-//    }
-//    __syncthreads();
-//
-//    /* compute the local histogram */
-//    atomicAdd(&local_hist[tid], 1);
-//    __syncthreads();
-//
-//    /* update the global histogram */
-//    if (tid < 256) {
-//        atomicAdd(&global_hist[tid], local_hist[tid]);
-//    }
-//    __syncthreads();
-//
-//    /* return the global histogram addr */
-//    return global_hist;
-//}
-
-//__global__ void process_image_kernel(uchar *in, uchar *out) {
-//
-//    int tid = threadIdx.x;
-//    int index = blockIdx.x * blockDim.x + threadIdx.x;
-//    int cdf_min;
-//    __shared__ int cdf[256], m[256];
-//
-//    ///* compute the global histogram */
-//    //int *global_hist = compute_histogram(in, out);
-//
-//    //FIXME: remove
-//    if (tid == 0)
-//        printf("blockDim = %d\tblockIdx = %d\n", blockDim.x, blockIdx.x);
-//        //printf("index = %d\tblockId = %d\ttid = %d\n", index, blockIdx.x, tid);
-//    //if (index == 0) {
-//    //    for (int i=0 ; i<256 ; i++) {
-//    //        printf("global_hist[%d] = %d\n", global_hist[i]);
-//    //    }
-//    //}
-//
-//    ///* copy the global histogram localy */
-//    //if (tid < 256) {
-//    //    cdf[tid] = global_hist[tid];
-//    //}
-//    //__syncthreads();
-//
-//    ///* compute the prefix sum */
-//    //prefix_sum(cdf, 256);
-//
-//    ///* find cdf-min, and save it in register */
-//    //cdf_min = arr_min(cdf, 256);
-//
-//    ///* compute the map function to remape img values */
-//    //if (tid < 256) {
-//    //    m[tid] = 255 * (cdf[tid] - cdf_min) / (IMG_HEIGHT * IMG_WIDTH - cdf_min);
-//    //}
-//    //__syncthreads();
-//
-//    ///* process the img */
-//    //out[index] = m[in[index]];
-//    //__syncthreads();
-//}
-
 __device__ void compute_histogram(uchar *img, int *res, int res_size) {
 
     int tid = threadIdx.x;
     int work_per_thread = (IMG_WIDTH * IMG_HEIGHT) / blockDim.x;
     
-
     /* initialize the histogram */
     if (tid < 256) {
         res[tid] = 0;
@@ -223,8 +149,7 @@ __device__ void remap_img(uchar *in, uchar *out, uchar *map) {
     __syncthreads();
 }
 
-/* process a single image by a single threadBlock */
-__global__ void process_image_kernel(uchar *in, uchar *out) {
+__device__ void process_image_kernel_aux(uchar *in, uchar *out) {
 
     __shared__ int cdf[256];
     __shared__ uchar m[256];
@@ -235,6 +160,21 @@ __global__ void process_image_kernel(uchar *in, uchar *out) {
     arr_min(cdf, 256, &cdf_positive_min);
     compute_map(cdf, cdf_positive_min, m);
     remap_img(in, out, m);
+}
+
+/* process a single image by a single threadBlock */
+__global__ void process_image_kernel(uchar *in, uchar *out) {
+
+    process_image_kernel_aux(in, out);
+}
+
+/* process all images concurrently */
+__global__ void process_all_images_kernel(uchar *in, uchar *out) {
+
+    int bid = blockIdx.x;
+
+    int offset = bid * IMG_WIDTH * IMG_HEIGHT;
+    process_image_kernel_aux(in + offset, out + offset);
 }
 
 
@@ -316,30 +256,41 @@ int main() {
 
     // GPU bulk
     printf("\n=== GPU Bulk ===\n"); //Do not change
-    //TODO: allocate GPU memory for a all input images and all output images
+
+    uchar *device_all_imgs_in = NULL;
+    uchar *device_all_imgs_out = NULL;
+
+    /* allocate memeory on the GPU global memory */
+    CUDA_CHECK(cudaMalloc(&device_all_imgs_in, N_IMAGES * IMG_WIDTH * IMG_HEIGHT));
+    CUDA_CHECK(cudaMalloc(&device_all_imgs_out, N_IMAGES * IMG_WIDTH * IMG_HEIGHT));
+
     t_start = get_time_msec(); //Do not change
-    //TODO: copy all input images from images_in to the GPU memory you allocated
-    //TODO: invoke a kernel with N_IMAGES threadblocks, each working on a different image
-    //TODO: copy output images from GPU memory to images_out_gpu_bulk
+
+    /* copy the relevant image from images_in to the GPU memory allocated */
+    CUDA_CHECK(cudaMemcpy(device_all_imgs_in, images_in,
+                N_IMAGES * IMG_WIDTH * IMG_HEIGHT, cudaMemcpyHostToDevice));
+
+    int blocks = N_IMAGES;
+    int threads_in_block = 1024;
+
+    /* invoke the GPU kernel */
+    process_all_images_kernel<<<blocks, threads_in_block>>>
+        (device_all_imgs_in, device_all_imgs_out);
+
+    /* copy output from GPU memory to relevant location in images_out_gpu_serial */
+    CUDA_CHECK(cudaMemcpy(images_out_gpu_bulk, device_all_imgs_out,
+                N_IMAGES * IMG_WIDTH * IMG_HEIGHT, cudaMemcpyDeviceToHost));
+
     t_finish = get_time_msec(); //Do not change
+
+    /* free the GPU global memory allocated */
+    CUDA_CHECK(cudaFree(device_all_imgs_in));
+    CUDA_CHECK(cudaFree(device_all_imgs_out));
+
     distance_sqr = distance_sqr_between_image_arrays(images_out_cpu,
             images_out_gpu_bulk); // Do not change
     printf("total time %f [msec]  distance from baseline %lld (should be zero)\n",
             t_finish - t_start, distance_sqr); //Do not chhange
-
-    //FIXME: remove
-    /* check correctnes */
-    printf("\n=== CORECTNESS ===\n");
-    for (int i=0 ; i<N_IMAGES * IMG_HEIGHT * IMG_WIDTH ; i++) {
-        if (images_out_cpu[i] != images_out_gpu_serial[i]) {
-            printf("first wrong index is: %d\n", i);
-            printf("in[%d] = %d\n", i, images_in[i]);
-            printf("out_cpu[%d] = %d\n", i, images_out_cpu[i]);
-            printf("out_gpu[%d] = %d\n", i, images_out_gpu_serial[i]);
-        }
-        assert(images_out_cpu[i] == images_out_gpu_serial[i]);
-        //assert(images_out_cpu[i] == images_out_gpu_bulk[i]);
-    }
 
     /* free allocated memory */
     CUDA_CHECK(cudaFreeHost(images_in));
