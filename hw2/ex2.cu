@@ -10,6 +10,8 @@
 ///////////////////////////////// DO NOT CHANGE ///////////////////////////////
 #define IMG_DIMENSION 32
 #define NREQUESTS 10000
+#define NSTREAMS 64
+#define AVAILABLE -1
 
 typedef unsigned char uchar;
 
@@ -203,6 +205,64 @@ void print_usage_and_die(char *progname) {
     exit(1);
 }
 
+bool is_stream_available(cudaStream_t *streams, int *stream_to_img, int idx) {
+    bool cond1 = cudaStreamQuery(streams[idx]) == cudaSuccess;
+    bool cond2 = stream_to_img[idx] == AVAILABLE;
+    return cond1 && cond2;
+}
+
+bool are_all_streams_available(cudaStream_t *streams, int *stream_to_img) {
+    for (int i=0 ; i<NSTREAMS ; i++) {
+        if (!is_stream_available(streams, stream_to_img, i))
+            return false;
+    }
+    return true;
+}
+
+/*
+ * iterate over the streams and check if any of them has finished their tasks,
+ * if so the end time of the images that have been proccesed is recorded.
+ */
+void check_completed_requests(cudaStream_t *streams, int *stream_to_img,
+        double *req_t_end) {
+
+    int img_idx;
+    for (int i=0 ; i<NSTREAMS ; i++) {
+        if (cudaStreamQuery(streams[i]) == cudaSuccess) {
+            img_idx = stream_to_img[i];
+            if (img_idx != AVAILABLE) {
+                /* stream[i] has finished its task */
+                req_t_end[img_idx] = get_time_msec();
+                stream_to_img[i] = AVAILABLE;
+            }
+            /* stream[i] didn't have any taks in process */
+        }
+    }
+}
+
+/* blocking until an available stream is found */
+int get_available_stream_idx(cudaStream_t *streams, int *stream_to_img,
+        double *req_t_end) {
+
+    int stream_idx = 0;
+    while (!is_stream_available(streams, stream_to_img, stream_idx)) {
+        stream_idx = (stream_idx + 1) % NSTREAMS;
+        //FIXME: can we make it bether? it is done in the new iteration anyway
+        /* all streams are buisy, check if some of them has finished */
+        if (stream_idx == 0)
+            check_completed_requests(streams, stream_to_img, req_t_end);
+    }
+    return stream_idx;
+}
+
+void wait_streams_done(cudaStream_t *streams, int *stream_to_img,
+        double *req_t_end) {
+
+    while (!are_all_streams_available(streams, stream_to_img)) {
+        check_completed_requests(streams, stream_to_img, req_t_end);
+    }
+}
+
 
 enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
 int main(int argc, char *argv[]) {
@@ -271,7 +331,7 @@ int main(int argc, char *argv[]) {
 
         CUDA_CHECK(cudaFree(gpu_image_in));
         CUDA_CHECK(cudaFree(gpu_image_out));
-    } while (0);
+    } while (0); //FIXME: why do we need this while loop ?
 
     /* now for the client-server part */
     printf("\n=== Client-Server ===\n");
@@ -284,23 +344,61 @@ int main(int argc, char *argv[]) {
     struct rate_limit_t rate_limit;
     rate_limit_init(&rate_limit, load, 0);
 
-    /* TODO allocate / initialize memory, streams, etc... */
+    /* allocate all memory needed for this part */
+    uchar *gpu_images_in, *gpu_images_out;
+
+    //FIXME: use cudaMalloc and cudaMemset ?!
+    int stream_to_img[NSTREAMS];
+    for (int i=0 ; i<NSTREAMS ; i++)
+        stream_to_img[i] = AVAILABLE;
+
+    CUDA_CHECK(cudaMalloc(&gpu_images_in, NREQUESTS * SQR(IMG_DIMENSION)));
+    CUDA_CHECK(cudaMalloc(&gpu_images_out, NREQUESTS * SQR(IMG_DIMENSION)));
+
+    //FIXME: do we need this ?
+    /* reset the GPU-Serial results */
     CUDA_CHECK(cudaMemset(images_out_from_gpu, 0, NREQUESTS * SQR(IMG_DIMENSION)));
 
     double ti = get_time_msec();
     if (mode == PROGRAM_MODE_STREAMS) {
+
+        /* create the streams */
+        cudaStream_t streams[NSTREAMS];
+        for (int i=0 ; i<NSTREAMS ; i++)
+            CUDA_CHECK(cudaStreamCreate(&streams[i]));
+
+        int stream_idx, img_offset;
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
 
-            /* TODO query (don't block) streams for any completed requests.
-             * update req_t_end of completed requests
-             */
+            /* check and record end-time for completed requests */
+            check_completed_requests(streams, stream_to_img, req_t_end);
 
+            /* wait for the next client "request" */
             rate_limit_wait(&rate_limit);
+
+            /* record start-time for the new request */
             req_t_start[img_idx] = get_time_msec();
 
-            /* TODO place memcpy's and kernels in a stream */
+            /* assign work to the available stream */
+            stream_idx = get_available_stream_idx(streams, stream_to_img, req_t_end);
+            stream_to_img[stream_idx] = img_idx;
+            img_offset = img_idx * SQR(IMG_DIMENSION);
+            CUDA_CHECK(cudaMemcpyAsync(&gpu_images_in[img_offset], &images_in[img_offset],
+                        SQR(IMG_DIMENSION), cudaMemcpyHostToDevice, streams[stream_idx]));
+            //FIXME: what is the '0' ?
+            gpu_process_image<<<1, 1024, 0, streams[stream_idx]>>>
+                (&gpu_images_in[img_offset], &gpu_images_out[img_offset]);
+            CUDA_CHECK(cudaMemcpyAsync(&images_out_from_gpu[img_offset],
+                        &gpu_images_out[img_offset], SQR(IMG_DIMENSION),
+                        cudaMemcpyDeviceToHost, streams[stream_idx]));
         }
-        /* TODO now make sure to wait for all streams to finish */
+
+        /* wait for all streams to finish */
+        wait_streams_done(streams, stream_to_img, req_t_end);
+
+        /* free streams */
+        for (int i=0 ; i<NSTREAMS ; i++)
+            CUDA_CHECK(cudaStreamDestroy(streams[i]));
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
         // TODO launch GPU consumer-producer kernel
@@ -334,6 +432,11 @@ int main(int argc, char *argv[]) {
     printf("distance from baseline %lf (should be zero)\n", total_distance);
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (tf - ti) * 1e+3);
     printf("average latency = %lf (msec)\n", avg_latency);
+
+    //FIXME: free all memory allocated
+    /* free all memory allocated */
+    CUDA_CHECK(cudaFree(gpu_images_in));
+    CUDA_CHECK(cudaFree(gpu_images_out));
 
     return 0;
 }
