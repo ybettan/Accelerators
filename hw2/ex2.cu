@@ -10,8 +10,6 @@
 ///////////////////////////////// DO NOT CHANGE ///////////////////////////////
 #define IMG_DIMENSION 32
 #define NREQUESTS 10000
-#define NSTREAMS 64
-#define AVAILABLE -1
 
 typedef unsigned char uchar;
 
@@ -91,16 +89,6 @@ int rate_limit_can_send(struct rate_limit_t *rate_limit) {
     return (p > r);
 }
 
-void rate_limit_wait(struct rate_limit_t *rate_limit) {
-    while (!rate_limit_can_send(rate_limit)) {
-        struct timespec t = {
-            0,
-            long(1. / (rate_limit->lambda * 1e-9) * 0.01)
-        };
-        nanosleep(&t, NULL);
-    }
-}
-
 double distance_sqr_between_image_arrays(uchar *img_arr1, uchar *img_arr2) {
     double distance_sqr = 0;
     for (int i = 0; i < NREQUESTS * SQR(IMG_DIMENSION); i++) {
@@ -158,7 +146,7 @@ __device__ void prefix_sum(int arr[], int arr_size) {
     }
 }
 
-__global__ void gpu_process_image(uchar *in, uchar *out) {
+__device__ void gpu_process_image_aux(uchar *in, uchar *out) {
     __shared__ int histogram[256];
     __shared__ int hist_min[256];
 
@@ -197,6 +185,10 @@ __global__ void gpu_process_image(uchar *in, uchar *out) {
     return;
 }
 
+__global__ void gpu_process_image(uchar *in, uchar *out) {
+    gpu_process_image_aux(in, out);
+}
+
 void print_usage_and_die(char *progname) {
     printf("usage:\n");
     printf("%s streams <load (requests/sec)>\n", progname);
@@ -204,6 +196,13 @@ void print_usage_and_die(char *progname) {
     printf("%s queue <#threads> <load (requests/sec)>\n", progname);
     exit(1);
 }
+
+//-----------------------------------------------------------------------------
+//                              Streams Aux
+//-----------------------------------------------------------------------------
+
+#define NSTREAMS 64
+#define AVAILABLE -1
 
 bool is_stream_available(cudaStream_t *streams, int *stream_to_img, int idx) {
     bool cond1 = cudaStreamQuery(streams[idx]) == cudaSuccess;
@@ -262,6 +261,253 @@ void wait_streams_done(cudaStream_t *streams, int *stream_to_img,
         check_completed_requests(streams, stream_to_img, req_t_end);
     }
 }
+
+//-----------------------------------------------------------------------------
+//                        Produce-Consumer Aux
+//-----------------------------------------------------------------------------
+
+#define QUEUE_SIZE 10
+#define STOP -1
+
+int get_num_concurrent_TBs(int threads_queue_mode) {
+
+    /* sinlge block utilization */
+    int shared_memory_per_block = 2*256*sizeof(int) + 256 * sizeof(uchar) + sizeof(int);
+    int threads_per_block = threads_queue_mode;
+    int registers_per_block = 32 * threads_per_block;
+
+    /* HW limitaion */
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    int shared_memory_per_sm = prop.sharedMemPerMultiprocessor;
+    int threads_per_sm = prop.maxThreadsPerMultiProcessor;
+    int registers_per_sm = prop.regsPerMultiprocessor;
+    int num_sm = prop.multiProcessorCount;
+
+    int res1 = shared_memory_per_sm / shared_memory_per_block;
+    int res2 = registers_per_sm / registers_per_block;
+    int res3 = threads_per_sm / threads_per_block;
+
+    int res = min(min(res1, res2), res3) * num_sm;
+    return res;
+}
+
+typedef struct Queue {
+    int head, tail, cpu_cnt, gpu_cnt;
+    int arr[QUEUE_SIZE];
+} Queue;
+
+void queue_init_cpu_side(Queue *queue) {
+    queue->head = 0;
+    queue->tail = -1;
+    queue->cpu_cnt = 0;
+    queue->gpu_cnt = 0;
+    __sync_synchronize();
+}
+
+int queue_get_size_cpu_side(Queue *queue) {
+    return abs(queue->cpu_cnt - queue->gpu_cnt);
+}
+
+bool queue_is_full_cpu_side(Queue *queue) {
+    return queue_get_size_cpu_side(queue) == QUEUE_SIZE;
+}
+
+bool queue_is_empty_cpu_side(Queue *queue) {
+    return queue_get_size_cpu_side(queue) == 0;
+}
+
+/* assumes the queue isn't full */
+void queue_enqueue_cpu_side(Queue *queue, int img_idx) {
+
+    assert(!queue_is_full_cpu_side(queue));
+
+    queue->tail = (queue->tail + 1) % QUEUE_SIZE;
+    queue->arr[queue->tail] = img_idx;
+    queue->cpu_cnt++;
+
+    __sync_synchronize();
+}
+
+/* assumes the queue isn't empty */
+void queue_dequeue_cpu_side(Queue *queue, int *img_idx) {
+
+    assert(!queue_is_empty_cpu_side(queue));
+
+    *img_idx = queue->arr[queue->head];
+    queue->head = (queue->head + 1) % QUEUE_SIZE;
+    queue->cpu_cnt++;
+
+    __sync_synchronize();
+}
+
+__device__ int queue_get_size_gpu_side(Queue *queue) {
+    return abs(queue->cpu_cnt - queue->gpu_cnt);
+}
+
+__device__ bool queue_is_full_gpu_side(Queue *queue) {
+    return queue_get_size_gpu_side(queue) == QUEUE_SIZE;
+}
+
+__device__ bool queue_is_empty_gpu_side(Queue *queue) {
+    return queue_get_size_gpu_side(queue) == 0;
+}
+
+/* assumes the queue isn't empty, onley thread 0 is enqueuing */
+__device__ void queue_enqueue_gpu_side(Queue *queue, int img_idx) {
+
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        __threadfence();
+        assert(!queue_is_full_gpu_side(queue));
+    }
+    __threadfence();
+
+    if (tid == 0) {
+        __threadfence();
+        queue->tail = (queue->tail + 1) % QUEUE_SIZE;
+        __threadfence();
+        queue->arr[queue->tail] = img_idx;
+        __threadfence();
+        queue->gpu_cnt++;
+    }
+    __threadfence_system();
+    __syncthreads();
+}
+
+/* assumes the queue isn't empty, only thread 0 is dequeuing */
+__device__ void queue_dequeue_gpu_side(Queue *queue, int *img_idx) {
+
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        __threadfence();
+        assert(!queue_is_empty_gpu_side(queue));
+    }
+    __threadfence();
+
+    if (tid == 0) {
+        __threadfence();
+        *img_idx = queue->arr[queue->head];
+        __threadfence();
+        queue->head = (queue->head + 1) % QUEUE_SIZE;
+    }
+    __threadfence();
+
+    if (tid == 0) {
+        __threadfence();
+        queue->gpu_cnt++;
+    }
+    __threadfence_system();
+    __syncthreads();
+}
+
+/*
+ * iterate over the gpu-cpu queues and check for img_idx that have been processed,
+ * if so the end time of the images that have been proccesed is recorded.
+ * return true if all images has been processed and false otherwise.
+ */
+bool check_completed_requests_cpu_side(Queue *gpu_cpu_queues_cpu_ptr,
+        int num_threadblocks, double *req_t_end, bool *threadblocks_done) {
+
+    int img_idx;
+    for (int i=0 ; i<num_threadblocks ; i++) {
+
+        while (!queue_is_empty_cpu_side(&gpu_cpu_queues_cpu_ptr[i])) {
+
+            queue_dequeue_cpu_side(&gpu_cpu_queues_cpu_ptr[i], &img_idx);
+
+            if (img_idx == STOP) {
+                threadblocks_done[i] = true;
+            } else {
+                req_t_end[img_idx] = get_time_msec();
+            }
+            __sync_synchronize();
+        }
+    }
+
+    for (int i=0 ; i<num_threadblocks ; i++) {
+        if (threadblocks_done[i] == false) {
+            return false;
+        }
+    }
+    __sync_synchronize();
+    return true;
+}
+
+__global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
+        Queue *cpu_gpu_queues_gpu_ptr, Queue *gpu_cpu_queues_gpu_ptr) {
+
+    __shared__ int img_idx;
+    int bid = blockIdx.x;
+    uchar *in, *out;
+    Queue *cpu_gpu_queue_gpu_ptr = &cpu_gpu_queues_gpu_ptr[bid];
+    Queue *gpu_cpu_queue_gpu_ptr = &gpu_cpu_queues_gpu_ptr[bid];
+
+    while (true) {
+
+        /* buisy wait to requests if stil no request arrived */
+        while (queue_is_empty_gpu_side(cpu_gpu_queue_gpu_ptr)) {
+            __threadfence_system();
+        }
+
+        /* only thread 0 in fact make the dequeue and return after __syncthread() */
+        queue_dequeue_gpu_side(cpu_gpu_queue_gpu_ptr, &img_idx);
+
+        __threadfence_system();
+
+        /* if block got a STOP msg its work is done */
+        if (img_idx == STOP) {
+
+            __threadfence_system();
+
+            /* buisy wait until gpu-cpu queue can enqueue */
+            while (queue_is_full_gpu_side(gpu_cpu_queue_gpu_ptr)) {
+                __threadfence_system();
+            }
+
+            __threadfence_system();
+
+            /* enqueue the processed img_idx */
+            queue_enqueue_gpu_side(gpu_cpu_queue_gpu_ptr, STOP);
+
+            __threadfence_system();
+
+            break;
+        }
+
+        __threadfence_system();
+
+        /* compute the ptrs according to the img id request */
+        in = &images_in[img_idx * SQR(IMG_DIMENSION)];
+        out = &images_out[img_idx * SQR(IMG_DIMENSION)];
+
+        __threadfence_system();
+
+        /* process the image */
+        gpu_process_image_aux(in, out);
+
+        __threadfence_system();
+
+        /* buisy wait until gpu-cpu queue can enqueue */
+        while (queue_is_full_gpu_side(gpu_cpu_queue_gpu_ptr)) {
+            __threadfence_system();
+        }
+
+        __threadfence_system();
+
+        /* enqueue the processed img_idx */
+        queue_enqueue_gpu_side(gpu_cpu_queue_gpu_ptr, img_idx);
+
+        __threadfence_system();
+        __syncthreads();
+    }
+    __threadfence_system();
+    __syncthreads();
+}
+
+//-----------------------------------------------------------------------------
 
 
 enum {PROGRAM_MODE_STREAMS = 0, PROGRAM_MODE_QUEUE};
@@ -331,7 +577,7 @@ int main(int argc, char *argv[]) {
 
         CUDA_CHECK(cudaFree(gpu_image_in));
         CUDA_CHECK(cudaFree(gpu_image_out));
-    } while (0); //FIXME: why do we need this while loop ?
+    } while (0);
 
     /* now for the client-server part */
     printf("\n=== Client-Server ===\n");
@@ -347,7 +593,6 @@ int main(int argc, char *argv[]) {
     /* allocate all memory needed for this part */
     uchar *gpu_images_in, *gpu_images_out;
 
-    //FIXME: use cudaMalloc and cudaMemset ?!
     int stream_to_img[NSTREAMS];
     for (int i=0 ; i<NSTREAMS ; i++)
         stream_to_img[i] = AVAILABLE;
@@ -355,7 +600,6 @@ int main(int argc, char *argv[]) {
     CUDA_CHECK(cudaMalloc(&gpu_images_in, NREQUESTS * SQR(IMG_DIMENSION)));
     CUDA_CHECK(cudaMalloc(&gpu_images_out, NREQUESTS * SQR(IMG_DIMENSION)));
 
-    //FIXME: do we need this ?
     /* reset the GPU-Serial results */
     CUDA_CHECK(cudaMemset(images_out_from_gpu, 0, NREQUESTS * SQR(IMG_DIMENSION)));
 
@@ -374,7 +618,10 @@ int main(int argc, char *argv[]) {
             check_completed_requests(streams, stream_to_img, req_t_end);
 
             /* wait for the next client "request" */
-            rate_limit_wait(&rate_limit);
+            if (!rate_limit_can_send(&rate_limit)) {
+                --img_idx;
+                continue;
+            }
 
             /* record start-time for the new request */
             req_t_start[img_idx] = get_time_msec();
@@ -385,7 +632,6 @@ int main(int argc, char *argv[]) {
             img_offset = img_idx * SQR(IMG_DIMENSION);
             CUDA_CHECK(cudaMemcpyAsync(&gpu_images_in[img_offset], &images_in[img_offset],
                         SQR(IMG_DIMENSION), cudaMemcpyHostToDevice, streams[stream_idx]));
-            //FIXME: what is the '0' ?
             gpu_process_image<<<1, 1024, 0, streams[stream_idx]>>>
                 (&gpu_images_in[img_offset], &gpu_images_out[img_offset]);
             CUDA_CHECK(cudaMemcpyAsync(&images_out_from_gpu[img_offset],
@@ -401,19 +647,92 @@ int main(int argc, char *argv[]) {
             CUDA_CHECK(cudaStreamDestroy(streams[i]));
 
     } else if (mode == PROGRAM_MODE_QUEUE) {
-        // TODO launch GPU consumer-producer kernel
-        for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
-            /* TODO check producer consumer queue for any responses.
-             * don't block. if no responses are there we'll check again in the next iteration
-             * update req_t_end of completed requests 
-             */
 
-            rate_limit_wait(&rate_limit);
+        /* compute num of TBs that can run concurentlly */
+        int num_threadblocks = get_num_concurrent_TBs(threads_queue_mode);
+
+        Queue *cpu_gpu_queues_cpu_ptr, *cpu_gpu_queues_gpu_ptr;
+        Queue *gpu_cpu_queues_cpu_ptr, *gpu_cpu_queues_gpu_ptr;
+
+        uchar *images_in_gpu_ptr, *images_out_from_gpu_gpu_ptr;
+        bool *threadblocks_done;
+        CUDA_CHECK( cudaHostAlloc(&threadblocks_done, num_threadblocks * sizeof(bool), 0) );
+        for (int i=0 ; i<num_threadblocks ; i++) {
+            threadblocks_done[i] = false;
+        }
+
+        /* allocate the producer-consumer queues in CPU-GPU shared memory */
+        CUDA_CHECK( cudaHostAlloc(&cpu_gpu_queues_cpu_ptr,
+                    num_threadblocks * sizeof(Queue), 0) );
+        CUDA_CHECK( cudaHostAlloc(&gpu_cpu_queues_cpu_ptr,
+                    num_threadblocks * sizeof(Queue), 0) );
+
+        /* give the GPU ptrs to those queues */
+        CUDA_CHECK( cudaHostGetDevicePointer(&cpu_gpu_queues_gpu_ptr,
+                    cpu_gpu_queues_cpu_ptr, 0) );
+        CUDA_CHECK( cudaHostGetDevicePointer(&gpu_cpu_queues_gpu_ptr,
+                    gpu_cpu_queues_cpu_ptr, 0) );
+
+        /* give the GPU ptrs to the images */
+        CUDA_CHECK( cudaHostGetDevicePointer(&images_in_gpu_ptr, images_in, 0) );
+        CUDA_CHECK( cudaHostGetDevicePointer(&images_out_from_gpu_gpu_ptr,
+                    images_out_from_gpu, 0) );
+
+        /* initialize the queues */
+        for (int i=0 ; i<num_threadblocks ; i++) {
+            queue_init_cpu_side(&cpu_gpu_queues_cpu_ptr[i]);
+            queue_init_cpu_side(&gpu_cpu_queues_cpu_ptr[i]);
+        }
+
+        /* lunch the kernel producer consumer loop */
+        producer_consumer_loop<<<num_threadblocks, threads_queue_mode>>>
+            (images_in_gpu_ptr, images_out_from_gpu_gpu_ptr,
+             cpu_gpu_queues_gpu_ptr, gpu_cpu_queues_gpu_ptr);
+
+        /* send all the requests to the queues */
+        for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
+
+            /* check for gpu response */
+            check_completed_requests_cpu_side(gpu_cpu_queues_cpu_ptr,
+                    num_threadblocks, req_t_end, threadblocks_done);
+
+            /* wait for the next request */
+            if (!rate_limit_can_send(&rate_limit)) {
+                --img_idx;
+                continue;
+            }
             req_t_start[img_idx] = get_time_msec();
 
-            /* TODO push task to queue */
+            /* push task to queue */
+            int bid = img_idx % num_threadblocks;
+            while (queue_is_full_cpu_side(&cpu_gpu_queues_cpu_ptr[bid])) {
+                __sync_synchronize();
+            }
+            queue_enqueue_cpu_side(&cpu_gpu_queues_cpu_ptr[bid], img_idx);
         }
-        /* TODO wait until you have responses for all requests */
+
+        /* notify all blocks that there are no more requests */
+        for (int i=0 ; i<num_threadblocks ; i++) {
+
+            /* check for gpu response */
+            check_completed_requests_cpu_side(gpu_cpu_queues_cpu_ptr,
+                    num_threadblocks, req_t_end, threadblocks_done);
+
+            while (queue_is_full_cpu_side(&cpu_gpu_queues_cpu_ptr[i])) {
+                __sync_synchronize();
+            }
+            queue_enqueue_cpu_side(&cpu_gpu_queues_cpu_ptr[i], STOP);
+        }
+
+        /* wait until all requests have been process */
+        while (!check_completed_requests_cpu_side(gpu_cpu_queues_cpu_ptr,
+                num_threadblocks, req_t_end, threadblocks_done));
+
+        /* free queues memory */
+        CUDA_CHECK( cudaFreeHost(cpu_gpu_queues_cpu_ptr) );
+        CUDA_CHECK( cudaFreeHost(gpu_cpu_queues_cpu_ptr) );
+        CUDA_CHECK( cudaFreeHost(threadblocks_done) );
+
     } else {
         assert(0);
     }
@@ -433,7 +752,6 @@ int main(int argc, char *argv[]) {
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (tf - ti) * 1e+3);
     printf("average latency = %lf (msec)\n", avg_latency);
 
-    //FIXME: free all memory allocated
     /* free all memory allocated */
     CUDA_CHECK(cudaFree(gpu_images_in));
     CUDA_CHECK(cudaFree(gpu_images_out));
