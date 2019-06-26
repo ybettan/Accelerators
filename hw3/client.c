@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include "common.h"
 
 #define NREQUESTS 10000
@@ -441,6 +442,82 @@ void process_images(struct client_context *ctx)
     printf("distance from baseline %lf (should be zero)\n", total_distance);
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (tf - ti) * 1e+3);
 }
+
+//FIXME: update it to work with RDMA
+//=============================================================================
+//                              Queueu hw2
+//=============================================================================
+
+int queue_get_size_cpu_side(Queue *queue) {
+    return abs(queue->cpu_cnt - queue->gpu_cnt);
+}
+
+bool queue_is_full_cpu_side(Queue *queue) {
+    return queue_get_size_cpu_side(queue) == QUEUE_SIZE;
+}
+
+bool queue_is_empty_cpu_side(Queue *queue) {
+    return queue_get_size_cpu_side(queue) == 0;
+}
+
+/* assumes the queue isn't full */
+void queue_enqueue_cpu_side(Queue *queue, int img_idx) {
+
+    assert(!queue_is_full_cpu_side(queue));
+
+    queue->tail = (queue->tail + 1) % QUEUE_SIZE;
+    queue->arr[queue->tail] = img_idx;
+    queue->cpu_cnt++;
+
+    __sync_synchronize();
+}
+
+/* assumes the queue isn't empty */
+void queue_dequeue_cpu_side(Queue *queue, int *img_idx) {
+
+    assert(!queue_is_empty_cpu_side(queue));
+
+    *img_idx = queue->arr[queue->head];
+    queue->head = (queue->head + 1) % QUEUE_SIZE;
+    queue->cpu_cnt++;
+
+    __sync_synchronize();
+}
+
+/*
+ * iterate over the gpu-cpu queues and check for img_idx that have been processed,
+ * if so the end time of the images that have been proccesed is recorded.
+ * return true if all images has been processed and false otherwise.
+ */
+bool check_completed_requests_cpu_side(Queue *gpu_cpu_queues_cpu_ptr,
+        int num_threadblocks, double *req_t_end, bool *threadblocks_done) {
+
+    int img_idx;
+    for (int i=0 ; i<num_threadblocks ; i++) {
+
+        while (!queue_is_empty_cpu_side(&gpu_cpu_queues_cpu_ptr[i])) {
+
+            queue_dequeue_cpu_side(&gpu_cpu_queues_cpu_ptr[i], &img_idx);
+
+            if (img_idx == STOP) {
+                threadblocks_done[i] = true;
+            } else {
+                req_t_end[img_idx] = get_time_msec();
+            }
+            __sync_synchronize();
+        }
+    }
+
+    for (int i=0 ; i<num_threadblocks ; i++) {
+        if (threadblocks_done[i] == false) {
+            return false;
+        }
+    }
+    __sync_synchronize();
+    return true;
+}
+
+//-----------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
     enum mode_enum mode;

@@ -62,7 +62,7 @@ __device__ void prefix_sum(int arr[], int arr_size) {
     }
 }
 
-__global__ void gpu_process_image(uchar *in, uchar *out) {
+__device__ void gpu_process_image_aux(uchar *in, uchar *out) {
     __shared__ int histogram[256];
     __shared__ int hist_min[256];
 
@@ -101,8 +101,179 @@ __global__ void gpu_process_image(uchar *in, uchar *out) {
     return;
 }
 
-/* TODO: copy queue-based GPU kernel from hw2 */
-/* TODO: end */
+__global__ void gpu_process_image(uchar *in, uchar *out) {
+    gpu_process_image_aux(in, out);
+}
+
+//=============================================================================
+//                                 Queue hw2
+//=============================================================================
+
+int get_num_concurrent_TBs(int threads_queue_mode) {
+
+    /* sinlge block utilization */
+    int shared_memory_per_block = 2*256*sizeof(int) + 256 * sizeof(uchar) + sizeof(int);
+    int threads_per_block = threads_queue_mode;
+    int registers_per_block = 32 * threads_per_block;
+
+    /* HW limitaion */
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    int shared_memory_per_sm = prop.sharedMemPerMultiprocessor;
+    int threads_per_sm = prop.maxThreadsPerMultiProcessor;
+    int registers_per_sm = prop.regsPerMultiprocessor;
+    int num_sm = prop.multiProcessorCount;
+
+    int res1 = shared_memory_per_sm / shared_memory_per_block;
+    int res2 = registers_per_sm / registers_per_block;
+    int res3 = threads_per_sm / threads_per_block;
+
+    int res = min(min(res1, res2), res3) * num_sm;
+    return res;
+}
+
+void queue_init_cpu_side(Queue *queue) {
+    queue->head = 0;
+    queue->tail = -1;
+    queue->cpu_cnt = 0;
+    queue->gpu_cnt = 0;
+    __sync_synchronize();
+}
+
+__device__ int queue_get_size_gpu_side(Queue *queue) {
+    return abs(queue->cpu_cnt - queue->gpu_cnt);
+}
+
+__device__ bool queue_is_full_gpu_side(Queue *queue) {
+    return queue_get_size_gpu_side(queue) == QUEUE_SIZE;
+}
+
+__device__ bool queue_is_empty_gpu_side(Queue *queue) {
+    return queue_get_size_gpu_side(queue) == 0;
+}
+
+/* assumes the queue isn't empty, onley thread 0 is enqueuing */
+__device__ void queue_enqueue_gpu_side(Queue *queue, int img_idx) {
+
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        __threadfence();
+        assert(!queue_is_full_gpu_side(queue));
+    }
+    __threadfence();
+
+    if (tid == 0) {
+        __threadfence();
+        queue->tail = (queue->tail + 1) % QUEUE_SIZE;
+        __threadfence();
+        queue->arr[queue->tail] = img_idx;
+        __threadfence();
+        queue->gpu_cnt++;
+    }
+    __threadfence_system();
+    __syncthreads();
+}
+
+/* assumes the queue isn't empty, only thread 0 is dequeuing */
+__device__ void queue_dequeue_gpu_side(Queue *queue, int *img_idx) {
+
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        __threadfence();
+        assert(!queue_is_empty_gpu_side(queue));
+    }
+    __threadfence();
+
+    if (tid == 0) {
+        __threadfence();
+        *img_idx = queue->arr[queue->head];
+        __threadfence();
+        queue->head = (queue->head + 1) % QUEUE_SIZE;
+    }
+    __threadfence();
+
+    if (tid == 0) {
+        __threadfence();
+        queue->gpu_cnt++;
+    }
+    __threadfence_system();
+    __syncthreads();
+}
+
+__global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
+        Queue *cpu_gpu_queues_gpu_ptr, Queue *gpu_cpu_queues_gpu_ptr) {
+
+    __shared__ int img_idx;
+    int bid = blockIdx.x;
+    uchar *in, *out;
+    Queue *cpu_gpu_queue_gpu_ptr = &cpu_gpu_queues_gpu_ptr[bid];
+    Queue *gpu_cpu_queue_gpu_ptr = &gpu_cpu_queues_gpu_ptr[bid];
+
+    while (true) {
+
+        /* buisy wait to requests if stil no request arrived */
+        while (queue_is_empty_gpu_side(cpu_gpu_queue_gpu_ptr)) {
+            __threadfence_system();
+        }
+
+        /* only thread 0 in fact make the dequeue and return after __syncthread() */
+        queue_dequeue_gpu_side(cpu_gpu_queue_gpu_ptr, &img_idx);
+
+        __threadfence_system();
+
+        /* if block got a STOP msg its work is done */
+        if (img_idx == STOP) {
+
+            __threadfence_system();
+
+            /* buisy wait until gpu-cpu queue can enqueue */
+            while (queue_is_full_gpu_side(gpu_cpu_queue_gpu_ptr)) {
+                __threadfence_system();
+            }
+
+            __threadfence_system();
+
+            /* enqueue the processed img_idx */
+            queue_enqueue_gpu_side(gpu_cpu_queue_gpu_ptr, STOP);
+
+            __threadfence_system();
+
+            break;
+        }
+
+        __threadfence_system();
+
+        /* compute the ptrs according to the img id request */
+        in = &images_in[img_idx * SQR(IMG_DIMENSION)];
+        out = &images_out[img_idx * SQR(IMG_DIMENSION)];
+
+        __threadfence_system();
+
+        /* process the image */
+        gpu_process_image_aux(in, out);
+
+        __threadfence_system();
+
+        /* buisy wait until gpu-cpu queue can enqueue */
+        while (queue_is_full_gpu_side(gpu_cpu_queue_gpu_ptr)) {
+            __threadfence_system();
+        }
+
+        __threadfence_system();
+
+        /* enqueue the processed img_idx */
+        queue_enqueue_gpu_side(gpu_cpu_queue_gpu_ptr, img_idx);
+
+        __threadfence_system();
+        __syncthreads();
+    }
+    __threadfence_system();
+    __syncthreads();
+}
+
+//-----------------------------------------------------------------------------
 
 void process_image_on_gpu(uchar *img_in, uchar *img_out)
 {
@@ -153,7 +324,7 @@ void allocate_memory(server_context *ctx)
     CUDA_CHECK(cudaHostAlloc(&ctx->images_out, OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION), 0));
     ctx->requests = (rpc_request *)calloc(OUTSTANDING_REQUESTS, sizeof(rpc_request));
 
-    /* TODO take CPU-GPU stream allocation code from hw2 */
+    /* TODO take CPU-GPU queues allocation code from hw2 */
 }
 
 void tcp_connection(server_context *ctx)
