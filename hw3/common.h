@@ -55,6 +55,13 @@ struct ib_info_t {
 
     /* TODO communicate number of queues / blocks, other information needed to operate the GPU queues remotely */
 
+    /* communicate number of queues / blocks to operate the GPU queues remotely */
+    int num_threadblocks;
+    int cpu_gpu_queues_rkey;
+    int gpu_cpu_queues_rkey;
+    Queue *cpu_gpu_queues_addr;
+    Queue *gpu_cpu_queues_addr;
+
 };
 
 enum mode_enum {

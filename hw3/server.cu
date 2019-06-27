@@ -109,11 +109,12 @@ __global__ void gpu_process_image(uchar *in, uchar *out) {
 //                                 Queue hw2
 //=============================================================================
 
-int get_num_concurrent_TBs(int threads_queue_mode) {
+#define THREADS_PER_BLOCK 1024
+
+int get_num_concurrent_TBs(int threads_per_block) {
 
     /* sinlge block utilization */
     int shared_memory_per_block = 2*256*sizeof(int) + 256 * sizeof(uchar) + sizeof(int);
-    int threads_per_block = threads_queue_mode;
     int registers_per_block = 32 * threads_per_block;
 
     /* HW limitaion */
@@ -203,23 +204,23 @@ __device__ void queue_dequeue_gpu_side(Queue *queue, int *img_idx) {
 }
 
 __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
-        Queue *cpu_gpu_queues_gpu_ptr, Queue *gpu_cpu_queues_gpu_ptr) {
+        Queue *cpu_gpu_queues, Queue *gpu_cpu_queues) {
 
     __shared__ int img_idx;
     int bid = blockIdx.x;
     uchar *in, *out;
-    Queue *cpu_gpu_queue_gpu_ptr = &cpu_gpu_queues_gpu_ptr[bid];
-    Queue *gpu_cpu_queue_gpu_ptr = &gpu_cpu_queues_gpu_ptr[bid];
+    Queue *cpu_gpu_queue = &cpu_gpu_queues[bid];
+    Queue *gpu_cpu_queue = &gpu_cpu_queues[bid];
 
     while (true) {
 
         /* buisy wait to requests if stil no request arrived */
-        while (queue_is_empty_gpu_side(cpu_gpu_queue_gpu_ptr)) {
+        while (queue_is_empty_gpu_side(cpu_gpu_queue)) {
             __threadfence_system();
         }
 
         /* only thread 0 in fact make the dequeue and return after __syncthread() */
-        queue_dequeue_gpu_side(cpu_gpu_queue_gpu_ptr, &img_idx);
+        queue_dequeue_gpu_side(cpu_gpu_queue, &img_idx);
 
         __threadfence_system();
 
@@ -229,14 +230,14 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
             __threadfence_system();
 
             /* buisy wait until gpu-cpu queue can enqueue */
-            while (queue_is_full_gpu_side(gpu_cpu_queue_gpu_ptr)) {
+            while (queue_is_full_gpu_side(gpu_cpu_queue)) {
                 __threadfence_system();
             }
 
             __threadfence_system();
 
             /* enqueue the processed img_idx */
-            queue_enqueue_gpu_side(gpu_cpu_queue_gpu_ptr, STOP);
+            queue_enqueue_gpu_side(gpu_cpu_queue, STOP);
 
             __threadfence_system();
 
@@ -257,14 +258,14 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
         __threadfence_system();
 
         /* buisy wait until gpu-cpu queue can enqueue */
-        while (queue_is_full_gpu_side(gpu_cpu_queue_gpu_ptr)) {
+        while (queue_is_full_gpu_side(gpu_cpu_queue)) {
             __threadfence_system();
         }
 
         __threadfence_system();
 
         /* enqueue the processed img_idx */
-        queue_enqueue_gpu_side(gpu_cpu_queue_gpu_ptr, img_idx);
+        queue_enqueue_gpu_side(gpu_cpu_queue, img_idx);
 
         __threadfence_system();
         __syncthreads();
@@ -314,7 +315,13 @@ struct server_context {
     struct ibv_mr *mr_requests; /* Memory region for RPC requests */
     struct ibv_mr *mr_images_in; /* Memory region for input images */
     struct ibv_mr *mr_images_out; /* Memory region for output images */
+
     /* TODO: add pointers and memory region(s) for CPU-GPU queues */
+    /* add pointers and memory region(s) for CPU-GPU queues */
+    Queue *cpu_gpu_queues; /* cpu_gpu_queues for all TBs */
+    Queue *gpu_cpu_queues; /* gpu_cpu_queues for all TBs */
+    struct ibv_mr *mr_cpu_gpu_queues; /* Memory region for cpu_gpu_queues */
+    struct ibv_mr *mr_gpu_cpu_queues; /* Memory region for gpu_cpu_queues */
     
 };
 
@@ -325,6 +332,11 @@ void allocate_memory(server_context *ctx)
     ctx->requests = (rpc_request *)calloc(OUTSTANDING_REQUESTS, sizeof(rpc_request));
 
     /* TODO take CPU-GPU queues allocation code from hw2 */
+    int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
+
+    /* CPU-GPU queues allocation code from hw2 */
+    CUDA_CHECK( cudaHostAlloc(&ctx->cpu_gpu_queues, num_threadblocks * sizeof(Queue), 0) );
+    CUDA_CHECK( cudaHostAlloc(&ctx->gpu_cpu_queues, num_threadblocks * sizeof(Queue), 0) );
 }
 
 void tcp_connection(server_context *ctx)
@@ -405,6 +417,25 @@ void initialize_verbs(server_context *ctx)
     }
 
     /* TODO register additional memory regions for CPU-GPU queues */
+    int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
+
+    /* register a memory region for the cpu_gpu_queues. */
+    ctx->mr_cpu_gpu_queues = ibv_reg_mr(ctx->pd, ctx->cpu_gpu_queues,
+            num_threadblocks * sizeof(Queue), IBV_ACCESS_LOCAL_WRITE |
+            IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!ctx->mr_cpu_gpu_queues) {
+        printf("ibv_reg_mr() failed for cpu_gpu_queues\n");
+        exit(1);
+    }
+
+    /* register a memory region for the gpu_cpu_queues. */
+    ctx->mr_gpu_cpu_queues = ibv_reg_mr(ctx->pd, ctx->gpu_cpu_queues,
+            num_threadblocks * sizeof(Queue), IBV_ACCESS_LOCAL_WRITE |
+            IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!ctx->mr_gpu_cpu_queues) {
+        printf("ibv_reg_mr() failed for gpu_cpu_queues\n");
+        exit(1);
+    }
 
     /* create completion queue (CQ). We'll use same CQ for both send and receive parts of the QP */
     ctx->cq = ibv_create_cq(ctx->context, 2 * OUTSTANDING_REQUESTS, NULL, NULL, 0); /* create a CQ with place for two completions per request */
@@ -450,6 +481,12 @@ void exchange_parameters(server_context *ctx, ib_info_t *client_info)
     my_info.lid = port_attr.lid;
     my_info.qpn = ctx->qp->qp_num;
     /* TODO add additional server rkeys / addresses here if needed */
+    /* additional server rkeys / addresses */
+    my_info.num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
+    my_info.cpu_gpu_queues_rkey = ctx->mr_cpu_gpu_queues->rkey;
+    my_info.gpu_cpu_queues_rkey = ctx->mr_gpu_cpu_queues->rkey;
+    my_info.cpu_gpu_queues_addr = ctx->cpu_gpu_queues;
+    my_info.gpu_cpu_queues_addr = ctx->gpu_cpu_queues;
 
     ret = send(ctx->socket_fd, &my_info, sizeof(struct ib_info_t), 0);
     if (ret < 0) {
@@ -670,6 +707,10 @@ void teardown_context(server_context *ctx)
     ibv_dereg_mr(ctx->mr_images_in);
     ibv_dereg_mr(ctx->mr_images_out);
     /* TODO destroy the additional server MRs here if needed */
+    /* destroy the additional server MRs */
+    ibv_dereg_mr(ctx->mr_cpu_gpu_queues);
+    ibv_dereg_mr(ctx->mr_gpu_cpu_queues);
+
     ibv_dealloc_pd(ctx->pd);
     ibv_close_device(ctx->context);
 }
@@ -701,6 +742,29 @@ int main(int argc, char *argv[]) {
 
     if (ctx.mode == MODE_QUEUE) {
         /* TODO run the GPU persistent kernel from hw2, for 1024 threads per block */
+
+        /* give the GPU ptrs to the queues */
+        Queue *cpu_gpu_queues_gpu_ptr, *gpu_cpu_queues_gpu_ptr;
+        CUDA_CHECK( cudaHostGetDevicePointer(&cpu_gpu_queues_gpu_ptr, ctx.cpu_gpu_queues, 0) );
+        CUDA_CHECK( cudaHostGetDevicePointer(&gpu_cpu_queues_gpu_ptr, ctx.gpu_cpu_queues, 0) );
+
+        /* give the GPU ptrs to the images */
+        uchar *images_in_gpu_ptr, *images_out_gpu_ptr;
+        CUDA_CHECK( cudaHostGetDevicePointer(&images_in_gpu_ptr, ctx.images_in, 0) );
+        CUDA_CHECK( cudaHostGetDevicePointer(&images_out_gpu_ptr, ctx.images_out, 0) );
+
+        /* compute num of TBs that can run concurentlly */
+        int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
+
+        /* initialize the queues */
+        for (int i=0 ; i<num_threadblocks ; i++) {
+            queue_init_cpu_side(&ctx.cpu_gpu_queues[i]);
+            queue_init_cpu_side(&ctx.gpu_cpu_queues[i]);
+        }
+
+        /* lunch the kernel producer consumer loop */
+        producer_consumer_loop<<<num_threadblocks, THREADS_PER_BLOCK>>>
+            (ctx.images_in, ctx.images_out, ctx.cpu_gpu_queues, ctx.gpu_cpu_queues);
     }
 
     /* now finally we get to the actual work, in the event loop */
