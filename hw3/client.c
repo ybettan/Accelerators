@@ -104,6 +104,11 @@ struct client_context {
     uchar *images_out_from_gpu;
 
     /* TODO add necessary context to track the client side of the GPU's producer/consumer queues */
+    /* add necessary context to track the client side of the GPU's producer/consumer queues */
+    bool *threadblocks_done;
+    int tmp;
+    struct ibv_mr *mr_tmp;
+
 };
 
 void rpc_call(struct client_context *ctx,
@@ -396,7 +401,217 @@ void allocate_and_register_memory(struct client_context *ctx)
         perror("Unable to create MR for sends");
         exit(1);
     }
+
+    /* Register a memory region for reading data from the queues */
+    ctx->mr_tmp = ibv_reg_mr(ctx->pd, &ctx->tmp, sizeof(int), IBV_ACCESS_LOCAL_WRITE);
+    if (!ctx->mr_tmp) {
+        perror("Unable to create MR for tmp");
+        exit(1);
+    }
 }
+
+//FIXME: update it to work with RDMA
+//=============================================================================
+//                              Queueu hw2
+//=============================================================================
+
+#define IRELEVANT -2
+
+typedef enum AccessType {
+    READ,
+    WRITE,
+} AccessType;
+
+typedef enum QueueDirection {
+    CPU_GPU,
+    GPU_CPU,
+} QueueDirection;
+
+typedef enum QueueAtrr {
+    CPU_CNT,
+    GPU_CNT,
+    HEAD,
+    TAIL,
+    ARR,
+} QueueAtrr;
+
+/* send RDMA Read to server to read the requested attr */
+int queue_access_attr_RDMA(struct client_context *ctx, AccessType access_type,
+        QueueDirection direction, int queue_idx, QueueAtrr attr, int val, int arr_idx) {
+
+    struct ibv_send_wr send_wr, *bad_send_wr;
+    struct ibv_sge sgl;
+
+    /* erase send_wr memory */
+    memset(&send_wr, 0, sizeof(struct ibv_send_wr));
+
+    /* set scatter-gather list for result */
+    if (access_type == WRITE) {
+        ctx->tmp = val;
+    }
+    sgl.addr = (uintptr_t)ctx->mr_tmp->addr;
+    sgl.length = sizeof(int);
+    sgl.lkey = ctx->mr_tmp->lkey;
+
+    /* compute queue addr and key */
+    Queue *queue_raddr;
+    int rkey;
+    if (direction == CPU_GPU) {
+        queue_raddr = &ctx->server_info.cpu_gpu_queues_addr[queue_idx];
+        rkey = ctx->server_info.cpu_gpu_queues_rkey;
+    } else {
+        queue_raddr = &ctx->server_info.gpu_cpu_queues_addr[queue_idx];
+        rkey = ctx->server_info.gpu_cpu_queues_rkey;
+    }
+
+    /* compute queue attr addr */
+    int *attr_raddr = NULL;
+    switch(attr) {
+
+        case(CPU_CNT):
+            attr_raddr = &queue_raddr->cpu_cnt;
+            break;
+
+        case(GPU_CNT):
+            attr_raddr = &queue_raddr->gpu_cnt;
+            break;
+
+        case(HEAD):
+            attr_raddr = &queue_raddr->head;
+            break;
+
+        case(TAIL):
+            attr_raddr = &queue_raddr->tail;
+            break;
+
+        case(ARR):
+            attr_raddr = &queue_raddr->arr[arr_idx];
+            break;
+    }
+
+    /* set RDMA read request */
+    send_wr.sg_list = &sgl;
+    send_wr.num_sge = 1;
+    send_wr.opcode = IBV_WR_RDMA_READ;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+    send_wr.wr.rdma.remote_addr = (uintptr_t)attr_raddr;
+    send_wr.wr.rdma.rkey = rkey;
+
+    /* send the request */
+    if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
+        printf("ERROR: ibv_post_send() failed\n");
+        exit(1);
+    }
+
+    /* return the result */
+    if (access_type == READ) {
+        return ctx->tmp;
+    } else {
+        return IRELEVANT;
+    }
+}
+
+/* send RDMA Read to server to read the requested attr */
+int queue_read_attr_RDMA(struct client_context *ctx, enum QueueDirection direction,
+        int queue_idx, enum QueueAtrr attr, int arr_idx) {
+
+    int res = queue_access_attr_RDMA(ctx, READ, direction, queue_idx, attr, IRELEVANT, arr_idx);
+    return res;
+}
+
+/* send RDMA Write to server to write the requested attr with some value */
+void queue_write_attr_RDMA(struct client_context *ctx, enum QueueDirection direction,
+        int queue_idx, enum QueueAtrr attr, int val, int arr_idx) {
+
+    queue_access_attr_RDMA(ctx, WRITE, direction, queue_idx, attr, val, arr_idx);
+}
+
+int queue_get_size_RDMA(struct client_context *ctx,
+        enum QueueDirection direction, int queue_idx) {
+
+    int cpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, IRELEVANT);
+    int gpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, GPU_CNT, IRELEVANT);
+
+    return abs(cpu_cnt - gpu_cnt);
+}
+
+bool queue_is_full_RDMA(struct client_context *ctx,
+        enum QueueDirection direction, int queue_idx) {
+
+    return queue_get_size_RDMA(ctx, direction, queue_idx) == QUEUE_SIZE;
+}
+
+bool queue_is_empty_RDMA(struct client_context *ctx,
+        enum QueueDirection direction, int queue_idx) {
+
+    return queue_get_size_RDMA(ctx, direction, queue_idx) == 0;
+}
+
+/* assumes the queue isn't full */
+void queue_enqueue_RDMA(struct client_context *ctx,
+        enum QueueDirection direction, int queue_idx, int img_idx) {
+
+    assert(!queue_is_full_RDMA(ctx, direction, queue_idx));
+
+    int tail = queue_read_attr_RDMA(ctx, direction, queue_idx, TAIL, IRELEVANT);
+    int new_tail = (tail + 1) % QUEUE_SIZE;
+    queue_write_attr_RDMA(ctx, direction, queue_idx, TAIL, new_tail, IRELEVANT);
+    queue_write_attr_RDMA(ctx, direction, queue_idx, ARR, img_idx, new_tail);
+    int cpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, IRELEVANT);
+    queue_write_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, ++cpu_cnt, IRELEVANT);
+
+    __sync_synchronize();
+}
+
+/* assumes the queue isn't empty */
+void queue_dequeue_RDMA(struct client_context *ctx,
+        enum QueueDirection direction, int queue_idx, int *img_idx) {
+
+    assert(!queue_is_empty_RDMA(ctx, direction, queue_idx));
+
+    int head = queue_read_attr_RDMA(ctx, direction, queue_idx, HEAD, IRELEVANT);
+    int list_head = queue_read_attr_RDMA(ctx, direction, queue_idx, ARR, head);
+    *img_idx = list_head;
+    int new_head = (head + 1) % QUEUE_SIZE;
+    queue_write_attr_RDMA(ctx, direction, queue_idx, HEAD, new_head, IRELEVANT);
+    int cpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, IRELEVANT);
+    queue_write_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, ++cpu_cnt, IRELEVANT);
+
+    __sync_synchronize();
+}
+
+/*
+ * iterate over the server queues and check for img_idx that have been processed.
+ * return true if all images has been processed and false otherwise.
+ */
+bool check_completed_requests_RDMA(struct client_context *ctx, int num_threadblocks,
+        bool *threadblocks_done) {
+
+    int img_idx;
+    for (int i=0 ; i<num_threadblocks ; i++) {
+
+        while (!queue_is_empty_RDMA(ctx, GPU_CPU, i)) {
+
+            queue_dequeue_RDMA(ctx, GPU_CPU, i, &img_idx);
+
+            if (img_idx == STOP) {
+                threadblocks_done[i] = true;
+            }
+            //FIXME: remove all __sync_synchronize ?
+            __sync_synchronize();
+        }
+    }
+
+    for (int i=0 ; i<num_threadblocks ; i++) {
+        if (threadblocks_done[i] == false) {
+            return false;
+        }
+    }
+    __sync_synchronize();
+    return true;
+}
+
+//-----------------------------------------------------------------------------
 
 void process_images(struct client_context *ctx)
 {
@@ -426,14 +641,37 @@ void process_images(struct client_context *ctx)
     } else {
         /* TODO use the queues implementation from homework 2 using RDMA */
 
-        for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
-            /* TODO check producer consumer queue for any responses.
-             * don't block. if no responses are there we'll check again in the next iteration
-             */
+        int num_threadblocks = ctx->server_info.num_threadblocks;
+        bool *threadblocks_done = ctx->threadblocks_done;
 
-            /* TODO push task to queue */
+        /* send all the requests to the queues */
+        for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
+
+            /* check for gpu response */
+            check_completed_requests_RDMA(ctx, num_threadblocks, threadblocks_done);
+
+            /* push task to queue */
+            int bid = img_idx % num_threadblocks;
+            while (queue_is_full_RDMA(ctx, CPU_GPU, bid)) {
+                __sync_synchronize();
+            }
+            queue_enqueue_RDMA(ctx, CPU_GPU, bid, img_idx);
         }
-        /* TODO wait until you have responses for all requests */
+
+        /* notify all blocks that there are no more requests */
+        for (int i=0 ; i<num_threadblocks ; i++) {
+
+            /* check for gpu response */
+            check_completed_requests_RDMA(ctx, num_threadblocks, threadblocks_done);
+
+            while (queue_is_full_RDMA(ctx, CPU_GPU, i)) {
+                __sync_synchronize();
+            }
+            queue_enqueue_RDMA(ctx, CPU_GPU, i, STOP);
+        }
+
+        /* wait until all requests have been process */
+        while (!check_completed_requests_RDMA(ctx, num_threadblocks, threadblocks_done));
     }
 
     double tf = get_time_msec();
@@ -442,82 +680,6 @@ void process_images(struct client_context *ctx)
     printf("distance from baseline %lf (should be zero)\n", total_distance);
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (tf - ti) * 1e+3);
 }
-
-//FIXME: update it to work with RDMA
-//=============================================================================
-//                              Queueu hw2
-//=============================================================================
-
-int queue_get_size_cpu_side(Queue *queue) {
-    return abs(queue->cpu_cnt - queue->gpu_cnt);
-}
-
-bool queue_is_full_cpu_side(Queue *queue) {
-    return queue_get_size_cpu_side(queue) == QUEUE_SIZE;
-}
-
-bool queue_is_empty_cpu_side(Queue *queue) {
-    return queue_get_size_cpu_side(queue) == 0;
-}
-
-/* assumes the queue isn't full */
-void queue_enqueue_cpu_side(Queue *queue, int img_idx) {
-
-    assert(!queue_is_full_cpu_side(queue));
-
-    queue->tail = (queue->tail + 1) % QUEUE_SIZE;
-    queue->arr[queue->tail] = img_idx;
-    queue->cpu_cnt++;
-
-    __sync_synchronize();
-}
-
-/* assumes the queue isn't empty */
-void queue_dequeue_cpu_side(Queue *queue, int *img_idx) {
-
-    assert(!queue_is_empty_cpu_side(queue));
-
-    *img_idx = queue->arr[queue->head];
-    queue->head = (queue->head + 1) % QUEUE_SIZE;
-    queue->cpu_cnt++;
-
-    __sync_synchronize();
-}
-
-/*
- * iterate over the gpu-cpu queues and check for img_idx that have been processed,
- * if so the end time of the images that have been proccesed is recorded.
- * return true if all images has been processed and false otherwise.
- */
-bool check_completed_requests_cpu_side(Queue *gpu_cpu_queues_cpu_ptr,
-        int num_threadblocks, double *req_t_end, bool *threadblocks_done) {
-
-    int img_idx;
-    for (int i=0 ; i<num_threadblocks ; i++) {
-
-        while (!queue_is_empty_cpu_side(&gpu_cpu_queues_cpu_ptr[i])) {
-
-            queue_dequeue_cpu_side(&gpu_cpu_queues_cpu_ptr[i], &img_idx);
-
-            if (img_idx == STOP) {
-                threadblocks_done[i] = true;
-            } else {
-                req_t_end[img_idx] = get_time_msec();
-            }
-            __sync_synchronize();
-        }
-    }
-
-    for (int i=0 ; i<num_threadblocks ; i++) {
-        if (threadblocks_done[i] == false) {
-            return false;
-        }
-    }
-    __sync_synchronize();
-    return true;
-}
-
-//-----------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
     enum mode_enum mode;

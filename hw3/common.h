@@ -46,6 +46,20 @@ struct rpc_request
 #define IB_PORT_SERVER 1
 #define IB_PORT_CLIENT 2
 
+//=============================================================================
+//                              Queue hw2
+//=============================================================================
+
+#define QUEUE_SIZE 10
+#define STOP -1
+
+typedef struct Queue {
+    int head, tail, cpu_cnt, gpu_cnt;
+    int arr[QUEUE_SIZE];
+} Queue;
+
+//-----------------------------------------------------------------------------
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct ib_info_t {
@@ -71,19 +85,6 @@ enum mode_enum {
 
 void parse_arguments(int argc, char **argv, enum mode_enum *mode, int *tcp_port);
 
-//=============================================================================
-//                              Queue hw2
-//=============================================================================
-
-#define QUEUE_SIZE 10
-#define STOP -1
-
-typedef struct Queue {
-    int head, tail, cpu_cnt, gpu_cnt;
-    int arr[QUEUE_SIZE];
-} Queue;
-
-//-----------------------------------------------------------------------------
 
 #ifdef __cplusplus
 }
