@@ -97,14 +97,12 @@ struct client_context {
     struct rpc_request* requests;
     struct ibv_mr *mr_requests;
     uchar *images_in;
-    struct ibv_mr *mr_images_in;
     uchar *images_out;
+    uchar *images_out_from_gpu;
+    struct ibv_mr *mr_images_in;
     struct ibv_mr *mr_images_out;
 
-    uchar *images_out_from_gpu;
-
-    /* TODO add necessary context to track the client side of the GPU's producer/consumer queues */
-    /* add necessary context to track the client side of the GPU's producer/consumer queues */
+    /* context to track the client side of the GPU's producer/consumer queues */
     bool *threadblocks_done;
     int tmp;
     struct ibv_mr *mr_tmp;
@@ -153,9 +151,12 @@ void rpc_call(struct client_context *ctx,
         exit(1);
     }
 
-    /* When WQE is completed we expect a CQE */
-    /* We also expect a completion of the RDMA Write with immediate operation from the server to us */
-    /* The order between the two is not guarenteed */
+    /*
+     * When WQE is completed we expect a CQE.
+     * We also expect a completion of the RDMA Write with immediate operation
+     * from the server to us.
+     * The order between the two is not guarenteed.
+     */
     int got_send_cqe = 0,
 	got_write_with_imm = img_out == NULL; /* One exception is the termination message which doesn't request an output */
     while (!got_send_cqe || !got_write_with_imm) {
@@ -240,8 +241,13 @@ struct client_context *setup_connection(int tcp_port) {
         exit(1);
     }
 
-    /* create completion queue (CQ). We'll use same CQ for both send and receive parts of the QP */
-    struct ibv_cq *cq = ibv_create_cq(context, 100, NULL, NULL, 0); /* create a CQ with place for 100 CQEs */
+    /*
+     * create completion queue (CQ).
+     * We'll use same CQ for both send and receive parts of the QP
+     */
+
+    /* create a CQ with place for 100 CQEs */
+    struct ibv_cq *cq = ibv_create_cq(context, 100, NULL, NULL, 0);
     if (!cq) {
         printf("ERROR: ibv_create_cq() failed\n");
         exit(1);
@@ -254,7 +260,8 @@ struct client_context *setup_connection(int tcp_port) {
     qp_init_attr.recv_cq = cq;
     qp_init_attr.qp_type = IBV_QPT_RC; /* we'll use RC transport service, which supports RDMA */
     qp_init_attr.cap.max_send_wr = 1; /* max of 1 WQE in-flight in SQ. that's enough for us */
-    qp_init_attr.cap.max_recv_wr = OUTSTANDING_REQUESTS; /* max of 1 WQE's in-flight in RQ per outstanding request. that's more than enough for us */
+    /* max of 1 WQE's in-flight in RQ per outstanding request. that's more than enough for us */
+    qp_init_attr.cap.max_recv_wr = OUTSTANDING_REQUESTS;
     qp_init_attr.cap.max_send_sge = 1; /* 1 SGE in each send WQE */
     qp_init_attr.cap.max_recv_sge = 1; /* 1 SGE in each recv WQE */
     struct ibv_qp *qp = ibv_create_qp(pd, &qp_init_attr);
@@ -300,8 +307,10 @@ struct client_context *setup_connection(int tcp_port) {
     qp_attr.qp_state = IBV_QPS_INIT;
     qp_attr.pkey_index = 0;
     qp_attr.port_num = IB_PORT_CLIENT;
-    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ; /* Allow the server to read / write our memory through this QP */
-    ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    /* Allow the server to read / write our memory through this QP */
+    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+    ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+            IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
         printf("ERROR: ibv_modify_qp() to INIT failed\n");
         exit(1);
@@ -321,7 +330,8 @@ struct client_context *setup_connection(int tcp_port) {
     qp_attr.ah_attr.sl = 0;
     qp_attr.ah_attr.src_path_bits = 0;
     qp_attr.ah_attr.port_num = IB_PORT_CLIENT;
-    ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU| IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+    ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
     if (ret) {
         printf("ERROR: ibv_modify_qp() to RTR failed\n");
         exit(1);
@@ -335,14 +345,17 @@ struct client_context *setup_connection(int tcp_port) {
     qp_attr.retry_cnt = 7;
     qp_attr.rnr_retry = 7;
     qp_attr.max_rd_atomic = 1;
-    ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+    ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         printf("ERROR: ibv_modify_qp() to RTS failed\n");
         exit(1);
     }
 
     /* now let's populate the receive QP with recv WQEs */
-    struct ibv_recv_wr recv_wr; /* this is the receive work request (the verb's representation for receive WQE) */
+
+    /* this is the receive work request (the verb's representation for receive WQE) */
+    struct ibv_recv_wr recv_wr;
     int i;
     for (i = 0; i < OUTSTANDING_REQUESTS; i++) {
         memset(&recv_wr, 0, sizeof(struct ibv_recv_wr));
@@ -369,6 +382,7 @@ void teardown_connection(struct client_context *ctx) {
         ibv_dereg_mr(ctx->mr_images_out);
     }
     ibv_dereg_mr(ctx->mr_requests);
+    ibv_dereg_mr(ctx->mr_tmp);
     ibv_destroy_qp(ctx->qp);
     ibv_destroy_cq(ctx->cq);
     ibv_dealloc_pd(ctx->pd);
@@ -377,24 +391,33 @@ void teardown_connection(struct client_context *ctx) {
 
 void allocate_and_register_memory(struct client_context *ctx)
 {
-    ctx->images_in = malloc(NREQUESTS * SQR(IMG_DIMENSION)); /* we concatenate all images in one huge array */
+    /* we concatenate all images in one huge array */
+    ctx->images_in = malloc(NREQUESTS * SQR(IMG_DIMENSION));
     ctx->images_out = malloc(NREQUESTS * SQR(IMG_DIMENSION));
     ctx->images_out_from_gpu = malloc(NREQUESTS * SQR(IMG_DIMENSION));
     struct rpc_request* requests = calloc(1, sizeof(struct rpc_request));
 
     assert(ctx->images_in && ctx->images_out && ctx->images_out_from_gpu);
 
+    /* allocate memory for threadblocks_done arr */
+    int num_threadblocks = ctx->server_info.num_threadblocks;
+    ctx->threadblocks_done = calloc(num_threadblocks, sizeof(bool));
+
     /* Register memory regions of our images input and output buffers for RDMA access */
-    ctx->mr_images_in = ibv_reg_mr(ctx->pd, ctx->images_in, NREQUESTS * SQR(IMG_DIMENSION), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+    ctx->mr_images_in = ibv_reg_mr(ctx->pd, ctx->images_in,
+            NREQUESTS * SQR(IMG_DIMENSION), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!ctx->mr_images_in) {
         perror("Unable to create input MR for RDMA");
         exit(1);
     }
-    ctx->mr_images_out = ibv_reg_mr(ctx->pd, ctx->images_out_from_gpu, NREQUESTS * SQR(IMG_DIMENSION), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+    ctx->mr_images_out = ibv_reg_mr(ctx->pd, ctx->images_out_from_gpu,
+            NREQUESTS * SQR(IMG_DIMENSION), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!ctx->mr_images_out) {
         perror("Unable to create output MR for RDMA");
         exit(1);
     }
+
     /* Register a memory region of our RPC request buffer */
     ctx->mr_requests = ibv_reg_mr(ctx->pd, requests, sizeof(struct rpc_request), 0);
     if (!ctx->mr_requests) {
@@ -410,17 +433,92 @@ void allocate_and_register_memory(struct client_context *ctx)
     }
 }
 
-//FIXME: update it to work with RDMA
 //=============================================================================
-//                              Queueu hw2
+//                       Image read/write RDMA
 //=============================================================================
-
-#define IRELEVANT -2
 
 typedef enum AccessType {
     READ,
     WRITE,
 } AccessType;
+
+/* send RDMA read/write to server to read/write the requested image */
+void image_access_RDMA(struct client_context *ctx, int img_idx, AccessType access_type) {
+
+    struct ibv_send_wr send_wr, *bad_send_wr;
+    struct ibv_sge sgl;
+
+    /* erase send_wr memory */
+    memset(&send_wr, 0, sizeof(struct ibv_send_wr));
+
+    /* set scatter-gather list for input/output */
+    int loffset = img_idx * SQR(IMG_DIMENSION);
+    if (access_type == WRITE) {
+        sgl.addr = (uintptr_t)(ctx->mr_images_in->addr + loffset);
+        sgl.lkey = ctx->mr_images_in->lkey;
+    } else {
+        sgl.addr = (uintptr_t)(ctx->mr_images_out->addr + loffset);
+        sgl.lkey = ctx->mr_images_out->lkey;
+    }
+    sgl.length = SQR(IMG_DIMENSION);
+
+    /* compute the image remote address */
+    uchar *img_raddr;
+    int rkey;
+    //FIXME: remove the '%' ?
+    int roffset = (img_idx % OUTSTANDING_REQUESTS) * SQR(IMG_DIMENSION);
+    if (access_type == WRITE) {
+        rkey = ctx->server_info.images_in_rkey;
+        img_raddr = ctx->server_info.images_in_addr + roffset;
+    } else {
+        rkey = ctx->server_info.images_out_rkey;
+        img_raddr = ctx->server_info.images_out_addr + roffset;
+    }
+
+    /* set RDMA access request */
+    send_wr.sg_list = &sgl;
+    send_wr.num_sge = 1;
+    send_wr.opcode = (access_type == READ) ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+    send_wr.wr.rdma.remote_addr = (uintptr_t)img_raddr;
+    send_wr.wr.rdma.rkey = rkey;
+
+    /* send the request */
+    if (ibv_post_send(ctx->qp, &send_wr, &bad_send_wr)) {
+        printf("ERROR: ibv_post_send() failed\n");
+        exit(1);
+    }
+
+    /* wait for RDMA completion */
+    int ncqes; /* num of CQEs polled */
+    struct ibv_wc wc; /* CQE */
+    do {
+        ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
+    } while (ncqes == 0);
+    if (ncqes < 0) {
+        printf("ERROR: ibv_poll_cq() failed\n");
+        exit(1);
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        printf("ERROR: got CQE with error '%s' (%d) (line %d)\n",
+                ibv_wc_status_str(wc.status), wc.status, __LINE__);
+        exit(1);
+    }
+}
+
+void image_read_RDMA(struct client_context *ctx, int img_idx) {
+    image_access_RDMA(ctx, img_idx, READ);
+}
+
+void image_write_RDMA(struct client_context *ctx, int img_idx) {
+    image_access_RDMA(ctx, img_idx, WRITE);
+}
+
+//=============================================================================
+//                              Queueu hw2
+//=============================================================================
+
+#define IRELEVANT -2
 
 typedef enum QueueDirection {
     CPU_GPU,
@@ -489,10 +587,10 @@ int queue_access_attr_RDMA(struct client_context *ctx, AccessType access_type,
             break;
     }
 
-    /* set RDMA read request */
+    /* set RDMA access request */
     send_wr.sg_list = &sgl;
     send_wr.num_sge = 1;
-    send_wr.opcode = IBV_WR_RDMA_READ;
+    send_wr.opcode = (access_type == READ) ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
     send_wr.send_flags = IBV_SEND_SIGNALED;
     send_wr.wr.rdma.remote_addr = (uintptr_t)attr_raddr;
     send_wr.wr.rdma.rkey = rkey;
@@ -502,6 +600,37 @@ int queue_access_attr_RDMA(struct client_context *ctx, AccessType access_type,
         printf("ERROR: ibv_post_send() failed\n");
         exit(1);
     }
+
+    /* wait for RDMA completion */
+    int ncqes; /* num of CQEs polled */
+    struct ibv_wc wc; /* CQE */
+    do {
+        ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
+    } while (ncqes == 0);
+    if (ncqes < 0) {
+        printf("ERROR: ibv_poll_cq() failed\n");
+        exit(1);
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        printf("ERROR: got CQE with error '%s' (%d) (line %d)\n",
+                ibv_wc_status_str(wc.status), wc.status, __LINE__);
+        exit(1);
+    }
+    //FIXME: remove
+    //printf("CQE popped\n");
+    //switch (wc.opcode) {
+    //case IBV_WC_SEND:
+    //    got_send_cqe = 1;
+    //    assert(wc.wr_id == request_id);
+    //    break;
+    //case IBV_WC_RECV_RDMA_WITH_IMM:
+    //    got_write_with_imm = 1;
+    //    assert(wc.imm_data == request_id);
+    //    break;
+    //default:
+    //    printf("Unexpected completion type\n");
+    //    assert(0);
+    //}
 
     /* return the result */
     if (access_type == READ) {
@@ -531,6 +660,12 @@ int queue_get_size_RDMA(struct client_context *ctx,
 
     int cpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, IRELEVANT);
     int gpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, GPU_CNT, IRELEVANT);
+
+    //FIXME: remove
+    //printf("\t\tcpu_cnt = %d, cpu_cnt raddr = %p\n",
+    //        cpu_cnt, &ctx->server_info.gpu_cpu_queues_addr->cpu_cnt);
+    //printf("\t\tgpu_cnt = %d, gpu_cnt raddr = %p\n",
+    //        gpu_cnt, &ctx->server_info.gpu_cpu_queues_addr->gpu_cnt);
 
     return abs(cpu_cnt - gpu_cnt);
 }
@@ -587,8 +722,16 @@ void queue_dequeue_RDMA(struct client_context *ctx,
 bool check_completed_requests_RDMA(struct client_context *ctx, int num_threadblocks,
         bool *threadblocks_done) {
 
+    //printf("checking coplited requests\n"); //FIXME: remove
     int img_idx;
     for (int i=0 ; i<num_threadblocks ; i++) {
+
+        //FIXME: remove
+        //printf("\tchecking completed requests for queue %d:\n", i);
+        //int cpu_cnt = queue_read_attr_RDMA(ctx, GPU_CPU, i, CPU_CNT, IRELEVANT);
+        //int gpu_cnt = queue_read_attr_RDMA(ctx, GPU_CPU, i, GPU_CNT, IRELEVANT);
+        //printf("\tcpu_cnt = %d\n", cpu_cnt);
+        //printf("\tgpu_cnt = %d\n", gpu_cnt);
 
         while (!queue_is_empty_RDMA(ctx, GPU_CPU, i)) {
 
@@ -596,10 +739,13 @@ bool check_completed_requests_RDMA(struct client_context *ctx, int num_threadblo
 
             if (img_idx == STOP) {
                 threadblocks_done[i] = true;
+            } else {
+                image_read_RDMA(ctx, img_idx);
             }
             //FIXME: remove all __sync_synchronize ?
             __sync_synchronize();
         }
+        //printf("\tqueue %d is empty\n", i); //FIXME: remove
     }
 
     for (int i=0 ; i<num_threadblocks ; i++) {
@@ -622,7 +768,8 @@ void process_images(struct client_context *ctx)
     printf("\n=== CPU ===\n");
     t_start  = get_time_msec();
     for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx)
-        process_image(&ctx->images_in[img_idx * SQR(IMG_DIMENSION)], &ctx->images_out[img_idx * SQR(IMG_DIMENSION)]);
+        process_image(&ctx->images_in[img_idx * SQR(IMG_DIMENSION)],
+                &ctx->images_out[img_idx * SQR(IMG_DIMENSION)]);
     t_finish = get_time_msec();
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (t_finish - t_start) * 1e+3);
 
@@ -631,7 +778,6 @@ void process_images(struct client_context *ctx)
 
     double ti = get_time_msec();
 
-
     if (ctx->mode == MODE_RPC_SERVER) {
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
             rpc_call(ctx, img_idx, 
@@ -639,7 +785,6 @@ void process_images(struct client_context *ctx)
                      &ctx->images_out_from_gpu[img_idx * SQR(IMG_DIMENSION)]);
         }
     } else {
-        /* TODO use the queues implementation from homework 2 using RDMA */
 
         int num_threadblocks = ctx->server_info.num_threadblocks;
         bool *threadblocks_done = ctx->threadblocks_done;
@@ -647,15 +792,23 @@ void process_images(struct client_context *ctx)
         /* send all the requests to the queues */
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
 
+            printf("img %d:", img_idx); //FIXME: remove
             /* check for gpu response */
             check_completed_requests_RDMA(ctx, num_threadblocks, threadblocks_done);
 
+            /* send the image to the server */
+            printf("\tRDMA writint img..."); //FIXME: remove
+            image_write_RDMA(ctx, img_idx);
+            printf("done\n"); //FIXME: remove
+
             /* push task to queue */
             int bid = img_idx % num_threadblocks;
+            printf("\tpushing img_idx %d to queue %d...", img_idx, bid); //FIXME: remove
             while (queue_is_full_RDMA(ctx, CPU_GPU, bid)) {
                 __sync_synchronize();
             }
             queue_enqueue_RDMA(ctx, CPU_GPU, bid, img_idx);
+            printf("done\n"); //FIXME: remove
         }
 
         /* notify all blocks that there are no more requests */
@@ -664,10 +817,13 @@ void process_images(struct client_context *ctx)
             /* check for gpu response */
             check_completed_requests_RDMA(ctx, num_threadblocks, threadblocks_done);
 
+            printf("queue %d:", i); //FIXME: remove
+            printf("\tpushing STOP..."); //FIXME: remove
             while (queue_is_full_RDMA(ctx, CPU_GPU, i)) {
                 __sync_synchronize();
             }
             queue_enqueue_RDMA(ctx, CPU_GPU, i, STOP);
+            printf("done\n"); //FIXME: remove
         }
 
         /* wait until all requests have been process */

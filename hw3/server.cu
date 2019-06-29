@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include "common.h"
 
-///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
+/////////////////////////////////////// DO NOT CHANGE /////////////////////////
 
 #define TCP_PORT_OFFSET 23456
 #define TCP_PORT_RANGE 1000
@@ -72,6 +72,7 @@ __device__ void gpu_process_image_aux(uchar *in, uchar *out) {
         histogram[tid] = 0;
     }
     __syncthreads();
+
 
     for (int i = tid; i < SQR(IMG_DIMENSION); i += blockDim.x)
         atomicAdd(&histogram[in[i]], 1);
@@ -212,6 +213,11 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
     Queue *cpu_gpu_queue = &cpu_gpu_queues[bid];
     Queue *gpu_cpu_queue = &gpu_cpu_queues[bid];
 
+    //FIXME: remove
+    if (threadIdx.x == 0) {
+        printf("block %d has started his loop\n", bid); //FIXME: remove
+    }
+
     while (true) {
 
         /* buisy wait to requests if stil no request arrived */
@@ -221,6 +227,10 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
 
         /* only thread 0 in fact make the dequeue and return after __syncthread() */
         queue_dequeue_gpu_side(cpu_gpu_queue, &img_idx);
+        //FIXME: remove
+        if (threadIdx.x == 0) {
+            printf("block %d got img %d\n", bid, img_idx); //FIXME: remove
+        }
 
         __threadfence_system();
 
@@ -238,6 +248,10 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
 
             /* enqueue the processed img_idx */
             queue_enqueue_gpu_side(gpu_cpu_queue, STOP);
+            //FIXME: remove
+            if (threadIdx.x == 0) {
+                printf("block %d enqueued STOP ACK\n", bid); //FIXME: remove
+            }
 
             __threadfence_system();
 
@@ -266,6 +280,10 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
 
         /* enqueue the processed img_idx */
         queue_enqueue_gpu_side(gpu_cpu_queue, img_idx);
+        //FIXME: remove
+        if (threadIdx.x == 0) {
+            printf("block %d enqueued ACK for img %d\n", bid, img_idx); //FIXME: remove
+        }
 
         __threadfence_system();
         __syncthreads();
@@ -306,6 +324,8 @@ struct server_context {
     rpc_request *requests; /* Array of outstanding requests received from the network */
     uchar *images_in; /* Input images for all outstanding requests */
     uchar *images_out; /* Output images for all outstanding requests */
+    Queue *cpu_gpu_queues; /* cpu_gpu_queues for all TBs */
+    Queue *gpu_cpu_queues; /* gpu_cpu_queues for all TBs */
 
     /* InfiniBand/verbs resources */
     struct ibv_context *context;
@@ -315,18 +335,20 @@ struct server_context {
     struct ibv_mr *mr_requests; /* Memory region for RPC requests */
     struct ibv_mr *mr_images_in; /* Memory region for input images */
     struct ibv_mr *mr_images_out; /* Memory region for output images */
-
-    /* TODO: add pointers and memory region(s) for CPU-GPU queues */
-    /* add pointers and memory region(s) for CPU-GPU queues */
-    Queue *cpu_gpu_queues; /* cpu_gpu_queues for all TBs */
-    Queue *gpu_cpu_queues; /* gpu_cpu_queues for all TBs */
     struct ibv_mr *mr_cpu_gpu_queues; /* Memory region for cpu_gpu_queues */
     struct ibv_mr *mr_gpu_cpu_queues; /* Memory region for gpu_cpu_queues */
+
+    /* give GPU access to queues and images */
+    Queue *cpu_gpu_queues_gpu_ptr;
+    Queue *gpu_cpu_queues_gpu_ptr;
+    uchar *images_in_gpu_ptr;
+    uchar *images_out_gpu_ptr;
     
 };
 
 void allocate_memory(server_context *ctx)
 {
+    /* allocate memory for the images buffers */
     CUDA_CHECK(cudaHostAlloc(&ctx->images_in, OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION), 0));
     CUDA_CHECK(cudaHostAlloc(&ctx->images_out, OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION), 0));
     ctx->requests = (rpc_request *)calloc(OUTSTANDING_REQUESTS, sizeof(rpc_request));
@@ -337,6 +359,19 @@ void allocate_memory(server_context *ctx)
     /* CPU-GPU queues allocation code from hw2 */
     CUDA_CHECK( cudaHostAlloc(&ctx->cpu_gpu_queues, num_threadblocks * sizeof(Queue), 0) );
     CUDA_CHECK( cudaHostAlloc(&ctx->gpu_cpu_queues, num_threadblocks * sizeof(Queue), 0) );
+
+    /* give the GPU access to the queues and images */
+    CUDA_CHECK( cudaHostGetDevicePointer(&ctx->cpu_gpu_queues_gpu_ptr, ctx->cpu_gpu_queues, 0) );
+    CUDA_CHECK( cudaHostGetDevicePointer(&ctx->gpu_cpu_queues_gpu_ptr, ctx->gpu_cpu_queues, 0) );
+    CUDA_CHECK( cudaHostGetDevicePointer(&ctx->images_in_gpu_ptr, ctx->images_in, 0) );
+    CUDA_CHECK( cudaHostGetDevicePointer(&ctx->images_out_gpu_ptr, ctx->images_out, 0) );
+
+    /* initialize the queues */
+    for (int i=0 ; i<num_threadblocks ; i++) {
+        queue_init_cpu_side(&ctx->cpu_gpu_queues[i]);
+        queue_init_cpu_side(&ctx->gpu_cpu_queues[i]);
+    }
+
 }
 
 void tcp_connection(server_context *ctx)
@@ -395,22 +430,27 @@ void initialize_verbs(server_context *ctx)
         exit(1);
     }
 
-    /* allocate a memory region for the RPC requests. */
-    ctx->mr_requests = ibv_reg_mr(ctx->pd, ctx->requests, sizeof(rpc_request) * OUTSTANDING_REQUESTS, IBV_ACCESS_LOCAL_WRITE);
+    /* register a memory region for the RPC requests. */
+    ctx->mr_requests = ibv_reg_mr(ctx->pd, ctx->requests,
+            sizeof(rpc_request) * OUTSTANDING_REQUESTS, IBV_ACCESS_LOCAL_WRITE);
     if (!ctx->mr_requests) {
         printf("ibv_reg_mr() failed for requests\n");
         exit(1);
     }
 
     /* register a memory region for the input / output images. */
-    ctx->mr_images_in = ibv_reg_mr(ctx->pd, ctx->images_in, OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION), IBV_ACCESS_LOCAL_WRITE);
+    ctx->mr_images_in = ibv_reg_mr(ctx->pd, ctx->images_in,
+            OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!ctx->mr_images_in) {
         printf("ibv_reg_mr() failed for input images\n");
         exit(1);
     }
 
     /* register a memory region for the input / output images. */
-    ctx->mr_images_out = ibv_reg_mr(ctx->pd, ctx->images_out, OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION), IBV_ACCESS_LOCAL_WRITE);
+    ctx->mr_images_out = ibv_reg_mr(ctx->pd, ctx->images_out,
+            OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!ctx->mr_images_out) {
         printf("ibv_reg_mr() failed for output images\n");
         exit(1);
@@ -437,8 +477,13 @@ void initialize_verbs(server_context *ctx)
         exit(1);
     }
 
-    /* create completion queue (CQ). We'll use same CQ for both send and receive parts of the QP */
-    ctx->cq = ibv_create_cq(ctx->context, 2 * OUTSTANDING_REQUESTS, NULL, NULL, 0); /* create a CQ with place for two completions per request */
+    /*
+     * create completion queue (CQ).
+     * We'll use same CQ for both send and receive parts of the QP
+     */
+
+    /* create a CQ with place for two completions per request */
+    ctx->cq = ibv_create_cq(ctx->context, 2 * OUTSTANDING_REQUESTS, NULL, NULL, 0);
     if (!ctx->cq) {
         printf("ERROR: ibv_create_cq() failed\n");
         exit(1);
@@ -449,9 +494,12 @@ void initialize_verbs(server_context *ctx)
     memset(&qp_init_attr, 0, sizeof(struct ibv_qp_init_attr));
     qp_init_attr.send_cq = ctx->cq;
     qp_init_attr.recv_cq = ctx->cq;
-    qp_init_attr.qp_type = IBV_QPT_RC; /* we'll use RC transport service, which supports RDMA */
-    qp_init_attr.cap.max_send_wr = OUTSTANDING_REQUESTS; /* max of 1 WQE in-flight in SQ per request. that's enough for us */
-    qp_init_attr.cap.max_recv_wr = OUTSTANDING_REQUESTS; /* max of 1 WQE in-flight in RQ per request. that's enough for us */
+    /* we'll use RC transport service, which supports RDMA */
+    qp_init_attr.qp_type = IBV_QPT_RC;
+    /* max of 1 WQE in-flight in SQ per request. that's enough for us */
+    qp_init_attr.cap.max_send_wr = OUTSTANDING_REQUESTS;
+    /* max of 1 WQE in-flight in RQ per request. that's enough for us */
+    qp_init_attr.cap.max_recv_wr = OUTSTANDING_REQUESTS;
     qp_init_attr.cap.max_send_sge = 1; /* 1 SGE in each send WQE */
     qp_init_attr.cap.max_recv_sge = 1; /* 1 SGE in each recv WQE */
     ctx->qp = ibv_create_qp(ctx->pd, &qp_init_attr);
@@ -463,7 +511,9 @@ void initialize_verbs(server_context *ctx)
 
 void exchange_parameters(server_context *ctx, ib_info_t *client_info)
 {
-    /* ok, before we continue we need to get info about the client' QP, and send it info about ours.
+    /*
+     * ok, before we continue we need to get info about the client' QP, and
+     * send it info about ours.
      * namely: QP number, and LID.
      * we'll use the TCP socket for that */
 
@@ -480,13 +530,17 @@ void exchange_parameters(server_context *ctx, ib_info_t *client_info)
     struct ib_info_t my_info;
     my_info.lid = port_attr.lid;
     my_info.qpn = ctx->qp->qp_num;
-    /* TODO add additional server rkeys / addresses here if needed */
+
     /* additional server rkeys / addresses */
     my_info.num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
     my_info.cpu_gpu_queues_rkey = ctx->mr_cpu_gpu_queues->rkey;
     my_info.gpu_cpu_queues_rkey = ctx->mr_gpu_cpu_queues->rkey;
     my_info.cpu_gpu_queues_addr = ctx->cpu_gpu_queues;
     my_info.gpu_cpu_queues_addr = ctx->gpu_cpu_queues;
+    my_info.images_in_rkey = ctx->mr_images_in->rkey;
+    my_info.images_out_rkey = ctx->mr_images_out->rkey;
+    my_info.images_in_addr = ctx->images_in;
+    my_info.images_out_addr = ctx->images_out;
 
     ret = send(ctx->socket_fd, &my_info, sizeof(struct ib_info_t), 0);
     if (ret < 0) {
@@ -595,6 +649,8 @@ void event_loop(server_context *ctx)
      *    the results.
      */
 
+    printf("event_loop:\n"); //FIXME: remove
+
     struct ibv_send_wr send_wr;
     struct ibv_send_wr *bad_send_wr;
     rpc_request* req;
@@ -610,13 +666,15 @@ void event_loop(server_context *ctx)
         int ncqes;
         do {
             ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
+            //printf("\tpolling CQE\n"); //FIXME: remove
         } while (ncqes == 0);
         if (ncqes < 0) {
             printf("ERROR: ibv_poll_cq() failed\n");
             exit(1);
         }
         if (wc.status != IBV_WC_SUCCESS) {
-            printf("ERROR: got CQE with error '%s' (%d) (line %d)\n", ibv_wc_status_str(wc.status), wc.status, __LINE__);
+            printf("ERROR: got CQE with error '%s' (%d) (line %d)\n",
+                    ibv_wc_status_str(wc.status), wc.status, __LINE__);
             exit(1);
         }
 
@@ -721,16 +779,41 @@ int main(int argc, char *argv[]) {
     parse_arguments(argc, argv, &ctx.mode, &ctx.tcp_port);
     if (!ctx.tcp_port) {
         srand(time(NULL));
-        ctx.tcp_port = TCP_PORT_OFFSET + (rand() % TCP_PORT_RANGE); /* to avoid conflicts with other users of the machine */
+        /* to avoid conflicts with other users of the machine */
+        ctx.tcp_port = TCP_PORT_OFFSET + (rand() % TCP_PORT_RANGE);
     }
 
     /* Initialize memory and CUDA resources */
     allocate_memory(&ctx);
 
+    //FIXME: remove
+    //printf("sizeof(Queue) = %lu\n", sizeof(Queue));
+    //printf("ctx.mr_gpu_cpu_queues->rkey = %d\n", ctx.mr_gpu_cpu_queues->rkey);
+    //printf("ctx.mr_gpu_cpu_queues->addr = %p\n", ctx.mr_gpu_cpu_queues->addr);
+    //printf("ctx.gpu_cpu_queues = %p\n", ctx.gpu_cpu_queues);
+    //for (int i=0 ; i<get_num_concurrent_TBs(THREADS_PER_BLOCK) ; i++) {
+    //    printf("queue %d:\n", i);
+    //    printf("cpu_cnt = %d, cpu_cnt_addr = %p\n",
+    //            ctx.gpu_cpu_queues[i].cpu_cnt,
+    //            &ctx.gpu_cpu_queues[i].cpu_cnt);
+    //    printf("gpu_cnt = %d, gpu_cnt_addr = %p\n",
+    //            ctx.gpu_cpu_queues[i].gpu_cnt,
+    //            &ctx.gpu_cpu_queues[i].gpu_cnt);
+    //    //printf("cpu_cnt = %d, cpu_cnt_addr = %p\n",
+    //    //        ((Queue*)(ctx.mr_gpu_cpu_queues->addr))->cpu_cnt,
+    //    //        &(((Queue*)(ctx.mr_gpu_cpu_queues->addr))->cpu_cnt));
+    //    //printf("gpu_cnt = %d, gpu_cnt_addr = %p\n",
+    //    //        ((Queue*)(ctx.mr_gpu_cpu_queues->addr))->gpu_cnt,
+    //    //        &(((Queue*)(ctx.mr_gpu_cpu_queues->addr))->gpu_cnt));
+    //}
+
     /* Create a TCP connection with the client to exchange InfiniBand parameters */
     tcp_connection(&ctx);
 
-    /* now that client has connected to us via TCP we'll open up some Infiniband resources and send it the parameters */
+    /*
+     * now that client has connected to us via TCP we'll open up some Infiniband
+     * resources and send it the parameters
+     */
     initialize_verbs(&ctx);
 
     /* exchange InfiniBand parameters with the client */
@@ -743,28 +826,14 @@ int main(int argc, char *argv[]) {
     if (ctx.mode == MODE_QUEUE) {
         /* TODO run the GPU persistent kernel from hw2, for 1024 threads per block */
 
-        /* give the GPU ptrs to the queues */
-        Queue *cpu_gpu_queues_gpu_ptr, *gpu_cpu_queues_gpu_ptr;
-        CUDA_CHECK( cudaHostGetDevicePointer(&cpu_gpu_queues_gpu_ptr, ctx.cpu_gpu_queues, 0) );
-        CUDA_CHECK( cudaHostGetDevicePointer(&gpu_cpu_queues_gpu_ptr, ctx.gpu_cpu_queues, 0) );
-
-        /* give the GPU ptrs to the images */
-        uchar *images_in_gpu_ptr, *images_out_gpu_ptr;
-        CUDA_CHECK( cudaHostGetDevicePointer(&images_in_gpu_ptr, ctx.images_in, 0) );
-        CUDA_CHECK( cudaHostGetDevicePointer(&images_out_gpu_ptr, ctx.images_out, 0) );
-
         /* compute num of TBs that can run concurentlly */
         int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
 
-        /* initialize the queues */
-        for (int i=0 ; i<num_threadblocks ; i++) {
-            queue_init_cpu_side(&ctx.cpu_gpu_queues[i]);
-            queue_init_cpu_side(&ctx.gpu_cpu_queues[i]);
-        }
-
         /* lunch the kernel producer consumer loop */
         producer_consumer_loop<<<num_threadblocks, THREADS_PER_BLOCK>>>
-            (ctx.images_in, ctx.images_out, ctx.cpu_gpu_queues, ctx.gpu_cpu_queues);
+            (ctx.images_in_gpu_ptr, ctx.images_out_gpu_ptr,
+             ctx.cpu_gpu_queues, ctx.gpu_cpu_queues);
+        CUDA_CHECK(cudaDeviceSynchronize()); //FIXME: remove ?
     }
 
     /* now finally we get to the actual work, in the event loop */

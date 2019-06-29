@@ -5,10 +5,12 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-///////////////////////////////////////////////// DO NOT CHANGE ///////////////////////////////////////
+///////////////////////////////// DO NOT CHANGE ////////////////////////////////
 
 #define IMG_DIMENSION 32
-#define OUTSTANDING_REQUESTS 100
+//FIXME: is this ok ?!
+//#define OUTSTANDING_REQUESTS 100
+#define OUTSTANDING_REQUESTS 10000
 
 #define SQR(a) ((a) * (a))
 
@@ -30,7 +32,8 @@ double static inline get_time_msec(void) {
 
 struct rpc_request
 {
-    int request_id; /* Returned to the client via RDMA write immediate value; use -1 to terminate */
+    /* Returned to the client via RDMA write immediate value; use -1 to terminate */
+    int request_id;
 
     /* Input buffer */
     int input_rkey;
@@ -65,16 +68,19 @@ typedef struct Queue {
 struct ib_info_t {
     int lid;
     int qpn;
-    /* TODO add additional server rkeys / addresses here if needed */
 
-    /* TODO communicate number of queues / blocks, other information needed to operate the GPU queues remotely */
-
-    /* communicate number of queues / blocks to operate the GPU queues remotely */
+    /* queues */
     int num_threadblocks;
     int cpu_gpu_queues_rkey;
     int gpu_cpu_queues_rkey;
     Queue *cpu_gpu_queues_addr;
     Queue *gpu_cpu_queues_addr;
+
+    /* images */
+    int images_in_rkey;
+    int images_out_rkey;
+    uchar *images_in_addr;
+    uchar *images_out_addr;
 
 };
 
