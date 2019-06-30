@@ -465,8 +465,7 @@ void image_access_RDMA(struct client_context *ctx, int img_idx, AccessType acces
     /* compute the image remote address */
     uchar *img_raddr;
     int rkey;
-    //FIXME: remove the '%' ?
-    int roffset = (img_idx % OUTSTANDING_REQUESTS) * SQR(IMG_DIMENSION);
+    int roffset = img_idx * SQR(IMG_DIMENSION);
     if (access_type == WRITE) {
         rkey = ctx->server_info.images_in_rkey;
         img_raddr = ctx->server_info.images_in_addr + roffset;
@@ -616,21 +615,6 @@ int queue_access_attr_RDMA(struct client_context *ctx, AccessType access_type,
                 ibv_wc_status_str(wc.status), wc.status, __LINE__);
         exit(1);
     }
-    //FIXME: remove
-    //printf("CQE popped\n");
-    //switch (wc.opcode) {
-    //case IBV_WC_SEND:
-    //    got_send_cqe = 1;
-    //    assert(wc.wr_id == request_id);
-    //    break;
-    //case IBV_WC_RECV_RDMA_WITH_IMM:
-    //    got_write_with_imm = 1;
-    //    assert(wc.imm_data == request_id);
-    //    break;
-    //default:
-    //    printf("Unexpected completion type\n");
-    //    assert(0);
-    //}
 
     /* return the result */
     if (access_type == READ) {
@@ -661,12 +645,6 @@ int queue_get_size_RDMA(struct client_context *ctx,
     int cpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, IRELEVANT);
     int gpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, GPU_CNT, IRELEVANT);
 
-    //FIXME: remove
-    //printf("\t\tcpu_cnt = %d, cpu_cnt raddr = %p\n",
-    //        cpu_cnt, &ctx->server_info.gpu_cpu_queues_addr->cpu_cnt);
-    //printf("\t\tgpu_cnt = %d, gpu_cnt raddr = %p\n",
-    //        gpu_cnt, &ctx->server_info.gpu_cpu_queues_addr->gpu_cnt);
-
     return abs(cpu_cnt - gpu_cnt);
 }
 
@@ -694,8 +672,6 @@ void queue_enqueue_RDMA(struct client_context *ctx,
     queue_write_attr_RDMA(ctx, direction, queue_idx, ARR, img_idx, new_tail);
     int cpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, IRELEVANT);
     queue_write_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, ++cpu_cnt, IRELEVANT);
-
-    __sync_synchronize();
 }
 
 /* assumes the queue isn't empty */
@@ -711,8 +687,6 @@ void queue_dequeue_RDMA(struct client_context *ctx,
     queue_write_attr_RDMA(ctx, direction, queue_idx, HEAD, new_head, IRELEVANT);
     int cpu_cnt = queue_read_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, IRELEVANT);
     queue_write_attr_RDMA(ctx, direction, queue_idx, CPU_CNT, ++cpu_cnt, IRELEVANT);
-
-    __sync_synchronize();
 }
 
 /*
@@ -722,16 +696,8 @@ void queue_dequeue_RDMA(struct client_context *ctx,
 bool check_completed_requests_RDMA(struct client_context *ctx, int num_threadblocks,
         bool *threadblocks_done) {
 
-    //printf("checking coplited requests\n"); //FIXME: remove
     int img_idx;
     for (int i=0 ; i<num_threadblocks ; i++) {
-
-        //FIXME: remove
-        //printf("\tchecking completed requests for queue %d:\n", i);
-        //int cpu_cnt = queue_read_attr_RDMA(ctx, GPU_CPU, i, CPU_CNT, IRELEVANT);
-        //int gpu_cnt = queue_read_attr_RDMA(ctx, GPU_CPU, i, GPU_CNT, IRELEVANT);
-        //printf("\tcpu_cnt = %d\n", cpu_cnt);
-        //printf("\tgpu_cnt = %d\n", gpu_cnt);
 
         while (!queue_is_empty_RDMA(ctx, GPU_CPU, i)) {
 
@@ -742,10 +708,7 @@ bool check_completed_requests_RDMA(struct client_context *ctx, int num_threadblo
             } else {
                 image_read_RDMA(ctx, img_idx);
             }
-            //FIXME: remove all __sync_synchronize ?
-            __sync_synchronize();
         }
-        //printf("\tqueue %d is empty\n", i); //FIXME: remove
     }
 
     for (int i=0 ; i<num_threadblocks ; i++) {
@@ -753,7 +716,6 @@ bool check_completed_requests_RDMA(struct client_context *ctx, int num_threadblo
             return false;
         }
     }
-    __sync_synchronize();
     return true;
 }
 
@@ -792,23 +754,16 @@ void process_images(struct client_context *ctx)
         /* send all the requests to the queues */
         for (int img_idx = 0; img_idx < NREQUESTS; ++img_idx) {
 
-            printf("img %d:", img_idx); //FIXME: remove
             /* check for gpu response */
             check_completed_requests_RDMA(ctx, num_threadblocks, threadblocks_done);
 
             /* send the image to the server */
-            printf("\tRDMA writint img..."); //FIXME: remove
             image_write_RDMA(ctx, img_idx);
-            printf("done\n"); //FIXME: remove
 
             /* push task to queue */
             int bid = img_idx % num_threadblocks;
-            printf("\tpushing img_idx %d to queue %d...", img_idx, bid); //FIXME: remove
-            while (queue_is_full_RDMA(ctx, CPU_GPU, bid)) {
-                __sync_synchronize();
-            }
+            while (queue_is_full_RDMA(ctx, CPU_GPU, bid));
             queue_enqueue_RDMA(ctx, CPU_GPU, bid, img_idx);
-            printf("done\n"); //FIXME: remove
         }
 
         /* notify all blocks that there are no more requests */
@@ -817,13 +772,8 @@ void process_images(struct client_context *ctx)
             /* check for gpu response */
             check_completed_requests_RDMA(ctx, num_threadblocks, threadblocks_done);
 
-            printf("queue %d:", i); //FIXME: remove
-            printf("\tpushing STOP..."); //FIXME: remove
-            while (queue_is_full_RDMA(ctx, CPU_GPU, i)) {
-                __sync_synchronize();
-            }
+            while (queue_is_full_RDMA(ctx, CPU_GPU, i));
             queue_enqueue_RDMA(ctx, CPU_GPU, i, STOP);
-            printf("done\n"); //FIXME: remove
         }
 
         /* wait until all requests have been process */

@@ -8,8 +8,14 @@
 ///////////////////////////////// DO NOT CHANGE ////////////////////////////////
 
 #define IMG_DIMENSION 32
-//FIXME: is this ok ?!
-//#define OUTSTANDING_REQUESTS 100
+/*
+ * originaly in was 100.
+ * the staff assumes for some reason our implementation of hw3 send the image
+ * itself in the producer consumer queue but my implementation send/receive only
+ * the image index.
+ * therefore to make the implementation easier I allocated a cell for each image
+ * in the server
+ */
 #define OUTSTANDING_REQUESTS 10000
 
 #define SQR(a) ((a) * (a))
@@ -62,8 +68,6 @@ typedef struct Queue {
 } Queue;
 
 //-----------------------------------------------------------------------------
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct ib_info_t {
     int lid;

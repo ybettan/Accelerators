@@ -213,11 +213,6 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
     Queue *cpu_gpu_queue = &cpu_gpu_queues[bid];
     Queue *gpu_cpu_queue = &gpu_cpu_queues[bid];
 
-    //FIXME: remove
-    if (threadIdx.x == 0) {
-        printf("block %d has started his loop\n", bid); //FIXME: remove
-    }
-
     while (true) {
 
         /* buisy wait to requests if stil no request arrived */
@@ -227,10 +222,6 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
 
         /* only thread 0 in fact make the dequeue and return after __syncthread() */
         queue_dequeue_gpu_side(cpu_gpu_queue, &img_idx);
-        //FIXME: remove
-        if (threadIdx.x == 0) {
-            printf("block %d got img %d\n", bid, img_idx); //FIXME: remove
-        }
 
         __threadfence_system();
 
@@ -248,10 +239,6 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
 
             /* enqueue the processed img_idx */
             queue_enqueue_gpu_side(gpu_cpu_queue, STOP);
-            //FIXME: remove
-            if (threadIdx.x == 0) {
-                printf("block %d enqueued STOP ACK\n", bid); //FIXME: remove
-            }
 
             __threadfence_system();
 
@@ -280,10 +267,6 @@ __global__ void producer_consumer_loop(uchar *images_in, uchar *images_out,
 
         /* enqueue the processed img_idx */
         queue_enqueue_gpu_side(gpu_cpu_queue, img_idx);
-        //FIXME: remove
-        if (threadIdx.x == 0) {
-            printf("block %d enqueued ACK for img %d\n", bid, img_idx); //FIXME: remove
-        }
 
         __threadfence_system();
         __syncthreads();
@@ -353,7 +336,6 @@ void allocate_memory(server_context *ctx)
     CUDA_CHECK(cudaHostAlloc(&ctx->images_out, OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION), 0));
     ctx->requests = (rpc_request *)calloc(OUTSTANDING_REQUESTS, sizeof(rpc_request));
 
-    /* TODO take CPU-GPU queues allocation code from hw2 */
     int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
 
     /* CPU-GPU queues allocation code from hw2 */
@@ -456,7 +438,6 @@ void initialize_verbs(server_context *ctx)
         exit(1);
     }
 
-    /* TODO register additional memory regions for CPU-GPU queues */
     int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
 
     /* register a memory region for the cpu_gpu_queues. */
@@ -649,8 +630,6 @@ void event_loop(server_context *ctx)
      *    the results.
      */
 
-    printf("event_loop:\n"); //FIXME: remove
-
     struct ibv_send_wr send_wr;
     struct ibv_send_wr *bad_send_wr;
     rpc_request* req;
@@ -666,7 +645,6 @@ void event_loop(server_context *ctx)
         int ncqes;
         do {
             ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
-            //printf("\tpolling CQE\n"); //FIXME: remove
         } while (ncqes == 0);
         if (ncqes < 0) {
             printf("ERROR: ibv_poll_cq() failed\n");
@@ -764,8 +742,6 @@ void teardown_context(server_context *ctx)
     ibv_dereg_mr(ctx->mr_requests);
     ibv_dereg_mr(ctx->mr_images_in);
     ibv_dereg_mr(ctx->mr_images_out);
-    /* TODO destroy the additional server MRs here if needed */
-    /* destroy the additional server MRs */
     ibv_dereg_mr(ctx->mr_cpu_gpu_queues);
     ibv_dereg_mr(ctx->mr_gpu_cpu_queues);
 
@@ -786,27 +762,6 @@ int main(int argc, char *argv[]) {
     /* Initialize memory and CUDA resources */
     allocate_memory(&ctx);
 
-    //FIXME: remove
-    //printf("sizeof(Queue) = %lu\n", sizeof(Queue));
-    //printf("ctx.mr_gpu_cpu_queues->rkey = %d\n", ctx.mr_gpu_cpu_queues->rkey);
-    //printf("ctx.mr_gpu_cpu_queues->addr = %p\n", ctx.mr_gpu_cpu_queues->addr);
-    //printf("ctx.gpu_cpu_queues = %p\n", ctx.gpu_cpu_queues);
-    //for (int i=0 ; i<get_num_concurrent_TBs(THREADS_PER_BLOCK) ; i++) {
-    //    printf("queue %d:\n", i);
-    //    printf("cpu_cnt = %d, cpu_cnt_addr = %p\n",
-    //            ctx.gpu_cpu_queues[i].cpu_cnt,
-    //            &ctx.gpu_cpu_queues[i].cpu_cnt);
-    //    printf("gpu_cnt = %d, gpu_cnt_addr = %p\n",
-    //            ctx.gpu_cpu_queues[i].gpu_cnt,
-    //            &ctx.gpu_cpu_queues[i].gpu_cnt);
-    //    //printf("cpu_cnt = %d, cpu_cnt_addr = %p\n",
-    //    //        ((Queue*)(ctx.mr_gpu_cpu_queues->addr))->cpu_cnt,
-    //    //        &(((Queue*)(ctx.mr_gpu_cpu_queues->addr))->cpu_cnt));
-    //    //printf("gpu_cnt = %d, gpu_cnt_addr = %p\n",
-    //    //        ((Queue*)(ctx.mr_gpu_cpu_queues->addr))->gpu_cnt,
-    //    //        &(((Queue*)(ctx.mr_gpu_cpu_queues->addr))->gpu_cnt));
-    //}
-
     /* Create a TCP connection with the client to exchange InfiniBand parameters */
     tcp_connection(&ctx);
 
@@ -824,7 +779,6 @@ int main(int argc, char *argv[]) {
     connect_qp(&ctx, &client_info);
 
     if (ctx.mode == MODE_QUEUE) {
-        /* TODO run the GPU persistent kernel from hw2, for 1024 threads per block */
 
         /* compute num of TBs that can run concurentlly */
         int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
@@ -833,7 +787,7 @@ int main(int argc, char *argv[]) {
         producer_consumer_loop<<<num_threadblocks, THREADS_PER_BLOCK>>>
             (ctx.images_in_gpu_ptr, ctx.images_out_gpu_ptr,
              ctx.cpu_gpu_queues, ctx.gpu_cpu_queues);
-        CUDA_CHECK(cudaDeviceSynchronize()); //FIXME: remove ?
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
     /* now finally we get to the actual work, in the event loop */
