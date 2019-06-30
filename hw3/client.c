@@ -104,7 +104,7 @@ struct client_context {
 
     /* context to track the client side of the GPU's producer/consumer queues */
     bool *threadblocks_done;
-    int tmp;
+    int tmp; /* used for reading/writing queue attributes */
     struct ibv_mr *mr_tmp;
 
 };
@@ -158,7 +158,8 @@ void rpc_call(struct client_context *ctx,
      * The order between the two is not guarenteed.
      */
     int got_send_cqe = 0,
-	got_write_with_imm = img_out == NULL; /* One exception is the termination message which doesn't request an output */
+    /* One exception is the termination message which doesn't request an output */
+	got_write_with_imm = img_out == NULL;
     while (!got_send_cqe || !got_write_with_imm) {
         do {
             ncqes = ibv_poll_cq(ctx->cq, 1, &wc);
@@ -168,7 +169,8 @@ void rpc_call(struct client_context *ctx,
             exit(1);
         }
         if (wc.status != IBV_WC_SUCCESS) {
-            printf("ERROR: got CQE with error '%s' (%d) (line %d)\n", ibv_wc_status_str(wc.status), wc.status, __LINE__);
+            printf("ERROR: got CQE with error '%s' (%d) (line %d)\n",
+                    ibv_wc_status_str(wc.status), wc.status, __LINE__);
             exit(1);
         }
         switch (wc.opcode) {
@@ -279,7 +281,7 @@ struct client_context *setup_connection(int tcp_port) {
     }
 
     /* send our info to server */
-    /*get our LID first */
+    /* get our LID first */
     struct ibv_port_attr port_attr;
     ret = ibv_query_port(context, IB_PORT_CLIENT, &port_attr);
     if (ret) {
@@ -297,9 +299,11 @@ struct client_context *setup_connection(int tcp_port) {
     /* we don't need TCP anymore. kill the socket */
     close(sfd);
 
-    /* now need to connect the QP to the server''s QP.
+    /*
+     * now need to connect the QP to the server''s QP.
      * this is a multi-phase process, moving the state machine of the QP step by step
-     * until we are ready */
+     * until we are ready
+     */
     struct ibv_qp_attr qp_attr;
 
     /*QP state: RESET -> INIT */
@@ -307,6 +311,7 @@ struct client_context *setup_connection(int tcp_port) {
     qp_attr.qp_state = IBV_QPS_INIT;
     qp_attr.pkey_index = 0;
     qp_attr.port_num = IB_PORT_CLIENT;
+
     /* Allow the server to read / write our memory through this QP */
     qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     ret = ibv_modify_qp(qp, &qp_attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
@@ -315,7 +320,6 @@ struct client_context *setup_connection(int tcp_port) {
         printf("ERROR: ibv_modify_qp() to INIT failed\n");
         exit(1);
     }
-
 
     /*QP: state: INIT -> RTR (Ready to Receive) */
     memset(&qp_attr, 0, sizeof(struct ibv_qp_attr));
@@ -434,13 +438,17 @@ void allocate_and_register_memory(struct client_context *ctx)
 }
 
 //=============================================================================
-//                       Image read/write RDMA
+//                           Commun types 
 //=============================================================================
 
 typedef enum AccessType {
     READ,
     WRITE,
 } AccessType;
+
+//=============================================================================
+//                       Image read/write RDMA
+//=============================================================================
 
 /* send RDMA read/write to server to read/write the requested image */
 void image_access_RDMA(struct client_context *ctx, int img_idx, AccessType access_type) {
@@ -782,7 +790,8 @@ void process_images(struct client_context *ctx)
 
     double tf = get_time_msec();
 
-    double total_distance = distance_sqr_between_image_arrays(ctx->images_out, ctx->images_out_from_gpu);
+    double total_distance = distance_sqr_between_image_arrays(ctx->images_out,
+            ctx->images_out_from_gpu);
     printf("distance from baseline %lf (should be zero)\n", total_distance);
     printf("throughput = %lf (req/sec)\n", NREQUESTS / (tf - ti) * 1e+3);
 }

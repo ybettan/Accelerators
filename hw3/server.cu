@@ -338,7 +338,7 @@ void allocate_memory(server_context *ctx)
 
     int num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
 
-    /* CPU-GPU queues allocation code from hw2 */
+    /* CPU-GPU queues allocation */
     CUDA_CHECK( cudaHostAlloc(&ctx->cpu_gpu_queues, num_threadblocks * sizeof(Queue), 0) );
     CUDA_CHECK( cudaHostAlloc(&ctx->gpu_cpu_queues, num_threadblocks * sizeof(Queue), 0) );
 
@@ -353,7 +353,6 @@ void allocate_memory(server_context *ctx)
         queue_init_cpu_side(&ctx->cpu_gpu_queues[i]);
         queue_init_cpu_side(&ctx->gpu_cpu_queues[i]);
     }
-
 }
 
 void tcp_connection(server_context *ctx)
@@ -420,19 +419,19 @@ void initialize_verbs(server_context *ctx)
         exit(1);
     }
 
-    /* register a memory region for the input / output images. */
+    /* register a memory region for the input images. */
     ctx->mr_images_in = ibv_reg_mr(ctx->pd, ctx->images_in,
             OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION),
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
     if (!ctx->mr_images_in) {
         printf("ibv_reg_mr() failed for input images\n");
         exit(1);
     }
 
-    /* register a memory region for the input / output images. */
+    /* register a memory region for the output images. */
     ctx->mr_images_out = ibv_reg_mr(ctx->pd, ctx->images_out,
             OUTSTANDING_REQUESTS * SQR(IMG_DIMENSION),
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
     if (!ctx->mr_images_out) {
         printf("ibv_reg_mr() failed for output images\n");
         exit(1);
@@ -512,7 +511,7 @@ void exchange_parameters(server_context *ctx, ib_info_t *client_info)
     my_info.lid = port_attr.lid;
     my_info.qpn = ctx->qp->qp_num;
 
-    /* additional server rkeys / addresses */
+    /* additional server rkeys / addresses of queues and images */
     my_info.num_threadblocks = get_num_concurrent_TBs(THREADS_PER_BLOCK);
     my_info.cpu_gpu_queues_rkey = ctx->mr_cpu_gpu_queues->rkey;
     my_info.gpu_cpu_queues_rkey = ctx->mr_gpu_cpu_queues->rkey;
@@ -545,7 +544,8 @@ void exchange_parameters(server_context *ctx, ib_info_t *client_info)
 /* Post a receive buffer of the given index (from the requests array) to the receive queue */
 void post_recv(server_context *ctx, int index)
 {
-    struct ibv_recv_wr recv_wr = {}; /* this is the receive work request (the verb's representation for receive WQE) */
+    /* this is the receive work request (the verb's representation for receive WQE) */
+    struct ibv_recv_wr recv_wr = {};
     ibv_sge sgl;
 
     recv_wr.wr_id = index;
@@ -571,8 +571,10 @@ void connect_qp(server_context *ctx, ib_info_t *client_info)
     qp_attr.qp_state = IBV_QPS_INIT;
     qp_attr.pkey_index = 0;
     qp_attr.port_num = IB_PORT_SERVER;
-    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ; /* we'll allow client to RDMA write and read on this QP */
-    int ret = ibv_modify_qp(ctx->qp, &qp_attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+    /* we'll allow client to RDMA write and read on this QP */
+    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+    int ret = ibv_modify_qp(ctx->qp, &qp_attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+            IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
         printf("ERROR: ibv_modify_qp() to INIT failed\n");
         exit(1);
@@ -591,7 +593,8 @@ void connect_qp(server_context *ctx, ib_info_t *client_info)
     qp_attr.ah_attr.sl = 0;
     qp_attr.ah_attr.src_path_bits = 0;
     qp_attr.ah_attr.port_num = IB_PORT_SERVER;
-    ret = ibv_modify_qp(ctx->qp, &qp_attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+    ret = ibv_modify_qp(ctx->qp, &qp_attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+            IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
     if (ret) {
         printf("ERROR: ibv_modify_qp() to RTR failed\n");
         exit(1);
@@ -605,7 +608,8 @@ void connect_qp(server_context *ctx, ib_info_t *client_info)
     qp_attr.retry_cnt = 7;
     qp_attr.rnr_retry = 7;
     qp_attr.max_rd_atomic = 1;
-    ret = ibv_modify_qp(ctx->qp, &qp_attr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+    ret = ibv_modify_qp(ctx->qp, &qp_attr, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         printf("ERROR: ibv_modify_qp() to RTS failed\n");
         exit(1);
